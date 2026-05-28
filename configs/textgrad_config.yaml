@@ -1,0 +1,34 @@
+llm:
+  base_url: "https://yunwu.ai/v1"
+  model: "gpt-4o-mini"
+  api_key: "sk-hJEO1ngxEgAb0wAAhTml9CR8Skw52sH8PUw36VLpV0sYHB3n"
+  cache_dir: "../caches/llm_cache"
+  max_concurrency: 8
+
+textgrad:
+  n_iterations: 5
+  train_batch_size: 64
+  val_batch_size: 64
+  commit_threshold_pp: -0.5
+
+dev_data:
+  source: "../data/recif/onerec_bench_release.parquet"
+  train_size: 500
+  val_size: 200
+  seed: 42
+
+prompts:
+  planner_init: "../prompts/planner_v0.txt"
+  compiler_init: "../prompts/compiler_v0.txt"
+  output_dir: "../prompts/optimized"
+
+reward:
+  metric: "R@10"
+  base_model_path: "OpenOneRec/OneRec-1.7B"  # Un-finetuned base model for reward
+
+stores:
+  cache_dir: "../caches"
+  pid2sid_video: "../data/recif/video_ad_pid2sid.parquet"
+  pid2sid_product: "../data/recif/product_pid2sid.parquet"
+
+cards_v2_dir: "../data/cards_v2"

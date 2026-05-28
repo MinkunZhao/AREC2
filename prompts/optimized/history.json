@@ -1,0 +1,32 @@
+[
+  {
+    "iter": 0,
+    "val": 0.905,
+    "improvement_pp": 1.0000000000000009,
+    "accepted": true
+  },
+  {
+    "iter": 1,
+    "val": 0.9,
+    "improvement_pp": -0.5000000000000004,
+    "accepted": false
+  },
+  {
+    "iter": 2,
+    "val": 0.9,
+    "improvement_pp": -0.5000000000000004,
+    "accepted": false
+  },
+  {
+    "iter": 3,
+    "val": 0.9,
+    "improvement_pp": -0.5000000000000004,
+    "accepted": false
+  },
+  {
+    "iter": 4,
+    "val": 0.905,
+    "improvement_pp": 0.0,
+    "accepted": true
+  }
+]

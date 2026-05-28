@@ -1,0 +1,94 @@
+# AREC² SFT Training Configuration
+
+# Model paths
+model:
+  base_model_path: "OpenOneRec/OneRec-1.7B"
+  output_dir: "./checkpoints/arec2-lora-r16"
+
+# LoRA configuration
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  bias: "none"
+  task_type: "CAUSAL_LM"
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+# Data configuration
+data:
+  recif_data_dir: "./data/recif"
+  general_sft_data_dir: "./data/general_sft"
+  pid2sid_path: "./data/recif/video_ad_pid2sid.parquet"
+  pid2sid_product_path: "./data/recif/product_pid2sid.parquet"
+
+  # Sampling
+  recif_ratio: 0.8  # 80% RecIF, 20% General_SFT
+#  max_recif_samples: 380000  # null for all samples
+  max_recif_samples: null
+  max_general_samples: 119250
+
+  # RecIF tasks to include (built from onerec_bench_release.parquet)
+  recif_tasks:
+    - "video"
+    - "ad"
+    - "product"
+    - "label_cond"
+    - "label_pred"
+
+  # Context enrichment
+  enrich_context: true
+  card_source: "heuristic"  # "heuristic", "llm_optimized", or "none"
+  cards_v2_dir: "./data/cards_v2"  # pre-computed cards (for llm_optimized)
+  token_budget: 1024
+  card_style: "natural"  # "natural" or "synthetic"
+
+  seed: 42
+
+# Training hyperparameters
+training:
+  num_train_epochs: 3
+  per_device_train_batch_size: 16
+  gradient_accumulation_steps: 1  # effective batch_size = 16
+  learning_rate: 5.0e-5
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  # Optimization
+  optim: "adamw_torch_fused"
+  bf16: true
+  gradient_checkpointing: true
+
+  # Logging and checkpointing
+  logging_steps: 50
+  save_steps: 1000
+  save_total_limit: 3
+
+  # Data loading
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+
+  # Other
+  remove_unused_columns: false
+  report_to: "none"  # or "tensorboard" if you want logging
+  max_length: 4096
+
+# Offline stores (for context enrichment)
+stores:
+  profile_store_path: "./caches/profile_store.pkl"
+  label_store_path: "./caches/label_behavior_store.pkl"
+  collab_store_path: "./caches/collaborative_store"
+  text_store_path: "./caches/item_text_store.pkl"
+
+# Evaluation (optional, can be null)
+evaluation:
+  eval_steps: null  # Set to integer to enable periodic evaluation
+  eval_strategy: "no"  # "no", "steps", or "epoch"
