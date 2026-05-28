@@ -1,8 +1,8 @@
 # AREC^2
 
-Agentic Retrieval-Enhanced Context-aware Recommendation
+Agentic Retrieval-Enrichment for Context-Aware Generative Recommendation
 
-AREC^2 是一个围绕 OpenOneRec/OneRec-1.7B 构建的推荐增强框架。项目目标是在 RecIF-Bench 场景中，把用户历史、标签行为、跨域信号、协同邻居和文本检索信号整理成可控的上下文卡片，再用于 SFT、RecPO/DPO 和评测，从而让模型不只依赖原始历史序列，而是显式利用结构化证据进行推荐。
+AREC^2 是一个围绕 OpenOneRec/OneRec-1.7B 构建的上下文感知生成式推荐增强框架。项目目标是在 RecIF-Bench 场景中，把用户画像、近期意图、标签行为、跨域信号、协同邻居和文本检索信号组织为可控的 retrieval-enriched context cards，再用于 SFT、RecPO/DPO 和评测，让模型在生成推荐结果时显式利用结构化证据。
 
 当前版本已经从早期的规则式 agentic enrichment 扩展到完整实验链路：
 
@@ -32,7 +32,6 @@ AREC^2/
 │   └── training/        # RecIF/General_SFT/CombinedDataset 数据管线
 ├── configs/
 │   ├── training_config.yaml
-│   ├── training_config_quick.yaml
 │   ├── dpo_config.yaml
 │   ├── textgrad_config.yaml
 │   └── judge_llm_config.json
@@ -48,6 +47,7 @@ AREC^2/
 ├── tests/               # stores、tools、compiler 单元/集成测试
 ├── README.md
 ├── requirements.txt
+└── code.txt             # 项目代码汇总文档，内嵌 README.md 内容
 ```
 
 ## 核心流程
@@ -68,7 +68,7 @@ python scripts/01_build_offline_stores.py
 - `caches/collaborative_store.meta.pkl`
 - `caches/item_text_store.pkl`
 
-这些缓存是 agentic enrichment、SFT、DPO 偏好生成和测试时 enrichment 的共同依赖。
+这些缓存是 retrieval enrichment、SFT、DPO 偏好生成和测试时 enrichment 的共同依赖。
 
 ### 2. 验证 agentic pipeline
 
@@ -82,16 +82,21 @@ python scripts/02_test_agentic_pipeline.py
 
 ### 3. SFT 训练
 
-快速实验配置：
-
-```bash
-python scripts/03_train_sft.py --config configs/training_config_quick.yaml
-```
-
-完整训练配置：
+当前项目只保留 `configs/training_config.yaml` 作为 SFT 配置入口，`configs/training_config_quick.yaml` 已删除。
 
 ```bash
 python scripts/03_train_sft.py --config configs/training_config.yaml
+```
+
+如果需要快速实验，直接在 `configs/training_config.yaml` 中临时调小采样量，例如：
+
+```yaml
+data:
+  max_recif_samples: 10000
+  max_general_samples: 2500
+
+training:
+  num_train_epochs: 1
 ```
 
 当前 SFT 数据管线要点：
@@ -107,7 +112,6 @@ python scripts/03_train_sft.py --config configs/training_config.yaml
 
 训练输出默认写入：
 
-- `checkpoints/arec2-lora-r16-quick/`
 - `checkpoints/arec2-lora-r16/`
 
 ### 4. 合并 LoRA
@@ -281,10 +285,7 @@ python scripts/02_test_agentic_pipeline.py
 # 检查 SFT 数据管线
 python scripts/test_data_pipeline.py
 
-# 快速 SFT
-python scripts/03_train_sft.py --config configs/training_config_quick.yaml
-
-# 完整 SFT
+# SFT 训练
 python scripts/03_train_sft.py --config configs/training_config.yaml
 
 # 合并 LoRA
@@ -313,9 +314,10 @@ python scripts/09_run_ablations.py
 
 ### `configs/training_config.yaml`
 
-完整 SFT 配置，默认：
+SFT 配置，默认：
 
 - base model：`OpenOneRec/OneRec-1.7B`
+- 输出目录：`checkpoints/arec2-lora-r16/`
 - LoRA：`r=16`、`alpha=32`、`dropout=0.05`
 - RecIF tasks：`video`、`ad`、`product`、`label_cond`、`label_pred`
 - `max_recif_samples: null`
@@ -323,16 +325,6 @@ python scripts/09_run_ablations.py
 - batch size：16
 - max length：4096
 - card source：`heuristic`
-
-### `configs/training_config_quick.yaml`
-
-快速 SFT 配置，默认：
-
-- LoRA：`r=2`
-- RecIF：10K
-- General_SFT：2.5K
-- epoch：1
-- 输出：`checkpoints/arec2-lora-r16-quick/`
 
 ### `configs/textgrad_config.yaml`
 
@@ -360,13 +352,15 @@ python scripts/09_run_ablations.py
 ```bash
 python tests/test_stores.py
 python tests/test_tools_and_compiler.py
-python scripts/sanity_check.py --config configs/training_config_quick.yaml
+python scripts/sanity_check.py --config configs/training_config.yaml
 ```
 
 当前项目不是标准 Python package 安装布局时，脚本会把项目根目录加入 `sys.path`。如果在 notebook 或交互式环境中使用，建议从项目根目录启动 Python。
 
 ## 注意事项
 
+- 项目全称统一为 Agentic Retrieval-Enrichment for Context-Aware Generative Recommendation，简称 AREC^2
+- `configs/training_config_quick.yaml` 已移除，所有训练和 sanity check 命令都应显式传入 `configs/training_config.yaml`
 - `caches/` 是当前代码使用的缓存目录，不是旧文档里的 `cache/`
 - 本地模型目录当前是 `models/1.7B/`，部分旧示例里的 `models/1.7B-pretrain/` 需要按实际情况替换
 - `scripts/08_eval_recif.py --enrich true` 参数保留兼容性，但脚本说明中标注它会改变 benchmark prompt，不适合作为 paper-comparable 官方结果
