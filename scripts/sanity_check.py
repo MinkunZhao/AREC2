@@ -1,6 +1,6 @@
 """Sanity checks for AREC² SFT pipeline after B1-B4 bug fixes.
 
-Run: python scripts/sanity_check.py --config configs/training_config_quick.yaml
+Run: python scripts/sanity_check.py --config configs/training_config.yaml
 
 Verification 1: Single sample loss behavior
 Verification 2: Truncation doesn't cut answer (100 longest samples)
@@ -269,7 +269,7 @@ def verification_4_check(config):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/training_config_quick.yaml")
+    parser.add_argument("--config", type=str, default="configs/training_config.yaml")
     args = parser.parse_args()
 
     with open(args.config, "r") as f:

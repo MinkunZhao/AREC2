@@ -268,7 +268,7 @@ def main():
 
     # Parse arguments
     parser = argparse.ArgumentParser(description="SFT training for AREC2")
-    parser.add_argument("--config", type=str, default="configs/training_config_quick.yaml")
+    parser.add_argument("--config", type=str, default="configs/training_config.yaml")
     parser.add_argument("--ablation", type=str, default=None, choices=["a0"],
                         help="a0: disable context enrichment (baseline)")
     parser.add_argument("--card_source", type=str, default="llm_optimized",
