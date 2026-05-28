@@ -93,7 +93,7 @@ def main():
                              "when on-policy yields too few non-GT SIDs.")
     parser.add_argument("--cand-pool-size", type=int, default=64,
                         help="Candidate pool size for P2 scoring (GT + negatives).")
-    parser.add_argument("--batch-size", type=int, default=16,
+    parser.add_argument("--batch-size", type=int, default=64,
                         help="Batch size for P1 greedy generation (higher = faster, more VRAM).")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -139,6 +139,21 @@ def main():
     # ---- PID->SID ----
     df_pid = pd.read_parquet(config["data"]["pid2sid_path"])
     pid2sid = {int(row["pid"]): list(row["sid"]) for _, row in df_pid.iterrows()}
+    
+    pid2sid_product = {}
+    product_path = config["data"].get("pid2sid_product_path", "")
+    if not product_path:
+        # fall back to the training config's convention
+        product_path = "./data/recif/product_pid2sid.parquet"
+    if Path(product_path).exists():
+        df_prod = pd.read_parquet(product_path)
+        pid2sid_product = {int(row["pid"]): list(row["sid"]) for _, row in df_prod.iterrows()}
+        logger.info("Loaded %d product PID->SID mappings from %s",
+                    len(pid2sid_product), product_path)
+    else:
+        logger.warning("product pid2sid not found at %s; product task will yield 0 samples",
+                       product_path)
+    
     sid_pool = build_sid_pool(pid2sid)
     logger.info("Loaded %d PID->SID; SID pool size=%d", len(pid2sid), len(sid_pool))
 
@@ -150,6 +165,7 @@ def main():
         planner=planner,
         executor=executor,
         pid2sid=pid2sid,
+        pid2sid_product=pid2sid_product,
         card_source="heuristic",
         max_samples=config["data"].get("max_samples", args.max_pairs * 3),
         seed=args.seed,

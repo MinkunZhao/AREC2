@@ -3,18 +3,19 @@
 model:
   base_model_path: "OpenOneRec/OneRec-1.7B"
   sft_checkpoint_path: "./checkpoints/arec2-lora-r16/final"
-  output_dir: "./checkpoints/arec2-dpo-r8"
+  output_dir: "./checkpoints/arec2-dpo-r16"
 
 lora:
-  r: 8
+  r: 16
   lora_alpha: 16
   lora_dropout: 0.05
 
 data:
   recif_data_dir: "./data/recif"
   pid2sid_path: "./data/recif/video_ad_pid2sid.parquet"
+  pid2sid_product_path: "./data/recif/product_pid2sid.parquet"
   preferences_dir: "./data/preferences"
-  max_samples: 100000  # max samples to draw from for pair generation
+  max_samples: 200000  # max samples to draw from for pair generation
 
 training:
   beta: 0.1
