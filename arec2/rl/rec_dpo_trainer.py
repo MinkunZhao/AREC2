@@ -11,6 +11,14 @@ Key adaptations / fixes:
   - Default loss_type is "sigmoid" (standard DPO). IPO is more aggressive on the
     very short SID answers in RecIF; switch to it only after sigmoid is verified
     not to regress.
+
+  v2 fixes (anti cross-task negative transfer):
+    - `rpo_alpha` adds an NLL term on the chosen completion, anchoring the policy
+      to the SFT manifold. This is the single most effective knob to stop "DPO
+      improves task A while hurting task B" (ad/product/label_pred regression).
+      Default 1.0; tune in [0.5, 1.0].
+    - `verify_reference_equivalence` now RETURNS the max logit diff so the caller
+      can hard-assert that the fresh adapter is truly identity at init.
 """
 
 from __future__ import annotations
@@ -71,6 +79,8 @@ def load_sft_model_for_dpo(
                         "gate_proj", "up_proj", "down_proj"],
     )
 
+    # autocast_adapter_dtype=False keeps the fresh adapter in fp32 so that
+    # LoRA B = 0 gives a numerically exact identity at init.
     model = get_peft_model(model, lora_config, autocast_adapter_dtype=False)
     model.enable_input_require_grads()
     model.print_trainable_parameters()
@@ -84,7 +94,7 @@ def create_dpo_trainer(
     train_dataset,
     eval_dataset=None,
     output_dir: str = "./checkpoints/arec2-dpo-r8",
-    beta: float = 0.1,
+    beta: float = 0.05,
     loss_type: str = "sigmoid",
     learning_rate: float = 5e-6,
     num_train_epochs: int = 1,
@@ -92,10 +102,16 @@ def create_dpo_trainer(
     gradient_accumulation_steps: int = 4,
     max_length: int = 2048,
     max_prompt_length: int = 1792,
+    rpo_alpha: float = 1.0,
 ) -> DPOTrainer:
     """Create a configured DPO trainer.
 
     Args:
+        beta: DPO temperature. Lower => more conservative (stays closer to the
+            SFT reference). v2 default 0.05 (was 0.1) to reduce negative transfer.
+        rpo_alpha: weight of the NLL-on-chosen anchoring term. >0 pulls the
+            policy toward the SFT manifold on chosen completions, which is the
+            primary defense against cross-task regression. Set 0 to disable.
         max_length: Max total (prompt + completion) length.
         max_prompt_length: Max prompt length. The completion (SID list + turn
             end) is short, so set this close to max_length to avoid dropping the
@@ -105,7 +121,7 @@ def create_dpo_trainer(
     if max_prompt_length >= max_length:
         max_prompt_length = max_length - 64  # always leave room for completion
 
-    training_args = DPOConfig(
+    dpo_kwargs = dict(
         output_dir=output_dir,
         num_train_epochs=num_train_epochs,
         per_device_train_batch_size=per_device_batch_size,
@@ -131,6 +147,20 @@ def create_dpo_trainer(
         label_pad_token_id=-100,
     )
 
+    # rpo_alpha is supported by recent TRL DPOConfig. Guard for older versions.
+    if rpo_alpha and rpo_alpha > 0:
+        try:
+            training_args = DPOConfig(rpo_alpha=rpo_alpha, **dpo_kwargs)
+            logger.info("DPOConfig with rpo_alpha=%.3f (chosen-NLL anchoring enabled).", rpo_alpha)
+        except TypeError:
+            logger.warning(
+                "Installed TRL DPOConfig does not accept rpo_alpha; "
+                "anchoring disabled. Upgrade trl>=0.8 to enable it."
+            )
+            training_args = DPOConfig(**dpo_kwargs)
+    else:
+        training_args = DPOConfig(**dpo_kwargs)
+
     trainer = DPOTrainer(
         model=model,
         args=training_args,
@@ -143,22 +173,22 @@ def create_dpo_trainer(
 
 
 @torch.no_grad()
-def verify_reference_equivalence(trainer: DPOTrainer, n_check: int = 2) -> None:
+def verify_reference_equivalence(trainer: DPOTrainer, n_check: int = 2) -> float:
     """Sanity check: the fresh adapter must start as identity so that the DPO
     reference (adapter disabled) == merged SFT model.
 
-    Logs the mean absolute logit difference between adapter-enabled and
+    Returns the mean absolute logit difference between adapter-enabled and
     adapter-disabled forward passes on a few training examples. At init it
-    should be ~0. Call this once before trainer.train().
+    should be ~0. Call this once before trainer.train() and assert it is small.
     """
     model = trainer.model
     if not isinstance(model, PeftModel):
         logger.info("Model is not a PeftModel; skipping reference check.")
-        return
+        return 0.0
 
     ds = trainer.train_dataset
     if ds is None or len(ds) == 0:
-        return
+        return 0.0
 
     tok = trainer.processing_class
     device = next(model.parameters()).device
@@ -189,3 +219,4 @@ def verify_reference_equivalence(trainer: DPOTrainer, n_check: int = 2) -> None:
         "(should be ~0 at init; large => fresh adapter is not identity)",
         max_diff,
     )
+    return max_diff

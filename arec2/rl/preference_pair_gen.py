@@ -1,10 +1,19 @@
 """Preference pair generation for RecPO (DPO training).
 
-Design (post bug-fix):
+Design (post bug-fix v2):
   All pairs share one invariant: `prompt + chosen` reconstructs a sequence that
   is structurally identical to what SFT trained on, and `chosen`/`rejected` are
   CANONICALIZED and LENGTH-MATCHED so DPO can only learn item identity, never a
   formatting shortcut.
+
+  v2 changes (fix ad/product/label_pred regression):
+    - NEW strategy "binary": for judgement tasks (label_pred) whose GT is "是"/"否"
+      with NO SID tokens. chosen = correct token, rejected = wrong token.
+      This keeps DPO from pushing label_pred's first-token mass away from 是/否.
+    - On-policy hard negative now supports a `rank_offset` so that for
+      ambiguous-candidate tasks (ad/product) we can take rank [need, 2*need)
+      instead of the single most-confident non-GT, avoiding over-penalizing
+      合理次优 items.
 
 Strategies:
   P1 - On-policy hard negative (workhorse):
@@ -20,6 +29,10 @@ Strategies:
   P3 - Counterfactual (optional, fixed):
         rejected = model generation under a WEAK (card-stripped) prompt,
                    canonicalized + length-matched.
+
+  B  - Binary judgement (label_pred):
+        chosen   = correct judgement token ("是"/"否")
+        rejected = the opposite token
 
 Output schema: {"prompt": str, "chosen": str, "rejected": str}
 Compatible with TRL DPOTrainer.
@@ -43,7 +56,8 @@ class DPOPair:
     prompt: str
     chosen: str
     rejected: str
-    strategy: str  # "onpolicy" | "score_hardneg" | "counterfactual"
+    strategy: str  # "onpolicy" | "score_hardneg" | "counterfactual" | "binary"
+    task_type: str = ""  # carried for per-task accounting / debugging
 
 
 # ----------------------------------------------------------------------------
@@ -88,14 +102,27 @@ def _match_length(
     gt_set: set[str],
     filler_pool: Optional[list[str]],
     rng: random.Random,
+    rank_offset: int = 0,
 ) -> Optional[list[str]]:
-    """Truncate/pad `rejected` to exactly target_len distinct non-GT SIDs."""
+    """Truncate/pad `rejected` to exactly target_len distinct non-GT SIDs.
+
+    Args:
+        rank_offset: skip this many leading distinct non-GT SIDs before
+            collecting. For ambiguous tasks (ad/product) we set this to
+            target_len so we take rank [need, 2*need) — i.e. the model's
+            *second-most-confident* non-GT items, which are less likely to be
+            合理次优 ground-truth-adjacent items.
+    """
     out: list[str] = []
     seen: set[str] = set()
+    skipped = 0
     for s in rejected:
         if s in gt_set or s in seen:
             continue
         seen.add(s)
+        if skipped < rank_offset:
+            skipped += 1
+            continue
         out.append(s)
         if len(out) == target_len:
             return out
@@ -114,6 +141,21 @@ def _match_length(
 
 
 # ----------------------------------------------------------------------------
+# Task taxonomy
+# ----------------------------------------------------------------------------
+# Tasks whose candidate space is ambiguous (co-click广告/商品 边界模糊): take a
+# rank offset so the model's single most-confident非GT (often a 合理次优 item)
+# is NOT used as an absolute negative.
+AMBIGUOUS_SID_TASKS = {"ad", "product"}
+
+# Judgement tasks: GT is 是/否, handled by the binary strategy.
+BINARY_TASKS = {"label_pred"}
+
+POSITIVE_TOKEN = "是"
+NEGATIVE_TOKEN = "否"
+
+
+# ----------------------------------------------------------------------------
 # P1: On-policy hard negative (default)
 # ----------------------------------------------------------------------------
 def generate_onpolicy_pair(
@@ -123,12 +165,15 @@ def generate_onpolicy_pair(
     filler_pool: Optional[list[str]] = None,
     rng: Optional[random.Random] = None,
     max_new_tokens: int = 256,
+    task_type: str = "",
 ) -> Optional[DPOPair]:
     """chosen = GT; rejected = model's greedy top-ranked non-GT SIDs.
 
     Greedy decoding gives the model's deterministic ranking; the first non-GT
     SIDs in that ranking are exactly the items the model wrongly prefers — i.e.
     on-policy hard negatives. This is the right signal when Recall is low.
+
+    For AMBIGUOUS_SID_TASKS we use rank_offset = need to take rank [need, 2*need).
     """
     rng = rng or random.Random()
     gt_list = parse_sid_list(gt_answer)
@@ -136,6 +181,7 @@ def generate_onpolicy_pair(
         return None
     gt_set = set(gt_list)
     need = len(gt_list)
+    rank_offset = need if task_type in AMBIGUOUS_SID_TASKS else 0
 
     gens = model.generate(
         messages,
@@ -148,7 +194,9 @@ def generate_onpolicy_pair(
         return None
 
     pred_list = parse_sid_list(gens[0])
-    rejected = _match_length(pred_list, need, gt_set, filler_pool, rng)
+    rejected = _match_length(
+        pred_list, need, gt_set, filler_pool, rng, rank_offset=rank_offset
+    )
     if rejected is None:
         return None
     if rejected == gt_list:  # model fully correct (rare) -> no useful signal
@@ -159,6 +207,7 @@ def generate_onpolicy_pair(
         chosen=_finalize_completion(gt_list, model.tokenizer),
         rejected=_finalize_completion(rejected, model.tokenizer),
         strategy="onpolicy",
+        task_type=task_type,
     )
 
 
@@ -168,15 +217,20 @@ def generate_onpolicy_pairs_batch(
     filler_pool: Optional[list[str]] = None,
     rng: Optional[random.Random] = None,
     max_new_tokens: int = 256,
+    task_types: Optional[list[str]] = None,
 ) -> list[Optional[DPOPair]]:
     """Batched P1: one generate_batch call for the whole batch.
 
     Each entry is (prompt_messages, gt_answer, gt_list) — caller pre-filters.
+    `task_types` (parallel list) lets us apply rank_offset per task. If None,
+    every entry is treated as a non-ambiguous SID task.
     Returns one Optional[DPOPair] per entry (None when pair cannot be built).
     """
     if not batch:
         return []
     rng = rng or random.Random()
+    if task_types is None:
+        task_types = [""] * len(batch)
 
     messages_list = [msgs for msgs, _, _ in batch]
     gens = model.generate_batch(
@@ -188,10 +242,14 @@ def generate_onpolicy_pairs_batch(
     )
 
     results: list[Optional[DPOPair]] = []
-    for (messages, _gt_answer, gt_list), gen_text in zip(batch, gens):
+    for (messages, _gt_answer, gt_list), gen_text, task_type in zip(batch, gens, task_types):
         gt_set = set(gt_list)
+        need = len(gt_list)
+        rank_offset = need if task_type in AMBIGUOUS_SID_TASKS else 0
         pred_list = parse_sid_list(gen_text)
-        rejected = _match_length(pred_list, len(gt_list), gt_set, filler_pool, rng)
+        rejected = _match_length(
+            pred_list, need, gt_set, filler_pool, rng, rank_offset=rank_offset
+        )
         if rejected is None or rejected == gt_list:
             results.append(None)
             continue
@@ -200,6 +258,7 @@ def generate_onpolicy_pairs_batch(
             chosen=_finalize_completion(gt_list, model.tokenizer),
             rejected=_finalize_completion(rejected, model.tokenizer),
             strategy="onpolicy",
+            task_type=task_type,
         ))
     return results
 
@@ -213,12 +272,13 @@ def generate_score_hardneg_pair(
     gt_answer: str,
     candidate_pool: list[str],
     rng: Optional[random.Random] = None,
+    task_type: str = "",
 ) -> Optional[DPOPair]:
     """rejected = highest log-prob NON-GT candidates (length matched to GT).
 
     candidate_pool entries MUST be single canonical SIDs (each tokenizes to 5
     tokens). More expensive than P1 (one forward per candidate) but yields the
-    hardest negatives.
+    hardest negatives. Honors rank_offset for ambiguous tasks.
     """
     rng = rng or random.Random()
     gt_list = parse_sid_list(gt_answer)
@@ -226,10 +286,13 @@ def generate_score_hardneg_pair(
         return None
     gt_set = set(gt_list)
     need = len(gt_list)
+    rank_offset = need if task_type in AMBIGUOUS_SID_TASKS else 0
 
     scored = model.score_candidates(messages, candidate_pool, enable_thinking=False)
     ranked_non_gt = [s.sid_str for s in scored if s.sid_str not in gt_set]
-    rejected = _match_length(ranked_non_gt, need, gt_set, None, rng)
+    rejected = _match_length(
+        ranked_non_gt, need, gt_set, None, rng, rank_offset=rank_offset
+    )
     if rejected is None or rejected == gt_list:
         return None
 
@@ -238,6 +301,7 @@ def generate_score_hardneg_pair(
         chosen=_finalize_completion(gt_list, model.tokenizer),
         rejected=_finalize_completion(rejected, model.tokenizer),
         strategy="score_hardneg",
+        task_type=task_type,
     )
 
 
@@ -269,6 +333,7 @@ def generate_counterfactual_pair(
     gt_answer: str,
     filler_pool: Optional[list[str]] = None,
     rng: Optional[random.Random] = None,
+    task_type: str = "",
 ) -> Optional[DPOPair]:
     """prompt = STRONG (card) context; chosen = GT; rejected = model output under
     the WEAK (no-card) prompt, canonicalized and length-matched."""
@@ -299,6 +364,44 @@ def generate_counterfactual_pair(
         chosen=_finalize_completion(gt_list, model.tokenizer),
         rejected=_finalize_completion(rejected, model.tokenizer),
         strategy="counterfactual",
+        task_type=task_type,
+    )
+
+
+# ----------------------------------------------------------------------------
+# B: Binary judgement (label_pred)
+# ----------------------------------------------------------------------------
+def generate_binary_pair(
+    model: OpenOneRecWrapper,
+    messages: list[dict],
+    gt_answer: str,
+    task_type: str = "label_pred",
+) -> Optional[DPOPair]:
+    """For judgement tasks whose GT is 是/否.
+
+    chosen = correct token (+ turn end), rejected = opposite token (+ turn end).
+    This trains the *judgement direction* without ever introducing SID tokens,
+    so DPO does not steal first-token probability mass from 是/否 — which is
+    exactly what the AUC-style label_pred eval reads.
+
+    Robust to minor formatting (leading/trailing spaces, "是。"等).
+    """
+    ans = (gt_answer or "").strip()
+    if POSITIVE_TOKEN in ans and NEGATIVE_TOKEN not in ans:
+        chosen_tok, rejected_tok = POSITIVE_TOKEN, NEGATIVE_TOKEN
+    elif NEGATIVE_TOKEN in ans and POSITIVE_TOKEN not in ans:
+        chosen_tok, rejected_tok = NEGATIVE_TOKEN, POSITIVE_TOKEN
+    else:
+        # Unrecognized / ambiguous judgement answer — skip.
+        return None
+
+    te = _turn_end_token(model.tokenizer)
+    return DPOPair(
+        prompt=build_prompt_text(messages, model.tokenizer),
+        chosen=chosen_tok + te,
+        rejected=rejected_tok + te,
+        strategy="binary",
+        task_type=task_type,
     )
 
 

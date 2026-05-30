@@ -1,7 +1,15 @@
-"""Phase D: DPO Training with RecPO preference pairs.
+"""Phase D: DPO Training with RecPO preference pairs (v2).
 
-Loads SFT v2 checkpoint, applies fresh LoRA (r=8), trains with DPO/IPO
-on the preference pairs from scripts/06_generate_preferences.py.
+Loads SFT v2 checkpoint, applies fresh LoRA (r=8), trains with DPO
+on the (now per-task-balanced + binary-for-label_pred) preference pairs from
+scripts/06_generate_preferences.py.
+
+v2 fixes:
+  - Passes rpo_alpha (chosen-NLL anchoring) and a lower beta to suppress
+    cross-task negative transfer (ad/product/label_pred regression).
+  - Hard-asserts reference equivalence so a non-identity fresh adapter fails
+    fast instead of silently corrupting the DPO reference (which especially
+    hurts the low-logit-margin label_pred judgement task).
 
 Usage:
     python scripts/07_train_dpo.py --config configs/dpo_config.yaml
@@ -20,7 +28,11 @@ import torch
 import yaml
 from datasets import Dataset
 
-from arec2.rl.rec_dpo_trainer import create_dpo_trainer, load_sft_model_for_dpo
+from arec2.rl.rec_dpo_trainer import (
+    create_dpo_trainer,
+    load_sft_model_for_dpo,
+    verify_reference_equivalence,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,8 +47,13 @@ def load_config(path: str) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DPO training for AREC2")
+    parser = argparse.ArgumentParser(description="DPO training for AREC2 (v2)")
     parser.add_argument("--config", type=str, default="configs/dpo_config.yaml")
+    parser.add_argument("--ref-check-tol", type=float, default=1e-3,
+                        help="Max allowed mean |logit diff| between adapter-enabled "
+                             "and disabled at init. Fail fast if exceeded.")
+    parser.add_argument("--skip-ref-assert", action="store_true",
+                        help="Only warn (do not abort) if reference equivalence check fails.")
     args = parser.parse_args()
 
     t0 = time.time()
@@ -80,25 +97,40 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         output_dir=model_config["output_dir"],
-        beta=training_config["beta"],
-        loss_type=training_config["loss_type"],
+        beta=training_config.get("beta", 0.05),
+        loss_type=training_config.get("loss_type", "sigmoid"),
         learning_rate=training_config["learning_rate"],
         num_train_epochs=training_config["num_train_epochs"],
         per_device_batch_size=training_config["per_device_train_batch_size"],
         gradient_accumulation_steps=training_config["gradient_accumulation_steps"],
         max_length=training_config["max_length"],
         max_prompt_length=training_config["max_prompt_length"],
+        rpo_alpha=training_config.get("rpo_alpha", 1.0),
     )
 
-    from arec2.rl.rec_dpo_trainer import verify_reference_equivalence
-    verify_reference_equivalence(trainer)  # 打印应 ~0，否则 fresh adapter 非 identity
+    # Hard reference-equivalence check: fresh adapter must be identity at init.
+    ref_diff = verify_reference_equivalence(trainer)
+    if ref_diff > args.ref_check_tol:
+        msg = (
+            f"Reference equivalence FAILED: max |logit diff| = {ref_diff:.3e} "
+            f"> tol {args.ref_check_tol:.1e}. The fresh DPO adapter is NOT identity "
+            f"at init, so the DPO reference != merged-SFT model. This silently "
+            f"corrupts low-margin tasks (e.g. label_pred AUC)."
+        )
+        if args.skip_ref_assert:
+            logger.warning(msg + " (continuing due to --skip-ref-assert)")
+        else:
+            raise RuntimeError(msg)
+    else:
+        logger.info("Reference equivalence OK (diff=%.3e <= tol=%.1e).", ref_diff, args.ref_check_tol)
 
     # Train
     logger.info("=" * 60)
     logger.info("Starting DPO training...")
     logger.info("  Pairs: %d", len(train_dataset))
-    logger.info("  Beta: %.2f", training_config["beta"])
-    logger.info("  Loss: %s", training_config["loss_type"])
+    logger.info("  Beta: %.3f", training_config.get("beta", 0.05))
+    logger.info("  rpo_alpha: %.3f", training_config.get("rpo_alpha", 1.0))
+    logger.info("  Loss: %s", training_config.get("loss_type", "sigmoid"))
     logger.info("  LR: %.2e", training_config["learning_rate"])
     logger.info("  LoRA rank: %d", lora_config["r"])
     logger.info("=" * 60)

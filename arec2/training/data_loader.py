@@ -5,6 +5,14 @@ agentic context cards) and General_SFT data.
 
 IMPORTANT: RecIF training samples are constructed from the release parquet
 (disjoint from test UIDs) to avoid test-set leakage.
+
+v2 fix (ad/product DPO regression):
+  - Context enrichment now extracts hist_pids per task using the CORRECT
+    history column (ad -> hist_ad, product -> hist_goods, etc.) instead of a
+    fixed priority list that always fell back to video PIDs. The planner is
+    also given pid2sid_video / pid2sid_product so cross_domain works.
+  This guarantees the enrichment card used at preference-generation time
+  matches the card used at SFT/eval time for the SAME task.
 """
 
 from __future__ import annotations
@@ -26,6 +34,16 @@ from arec2.agents.planner_agent import PlannerAgent
 logger = logging.getLogger(__name__)
 
 CardSource = Literal["heuristic", "llm_optimized", "none"]
+
+
+# Per-task history column used to seed enrichment. Ordered fallbacks per task.
+TASK_HIST_COLS = {
+    "video": ["hist_pid", "hist_longview"],
+    "ad": ["hist_ad", "hist_pid", "hist_longview"],
+    "product": ["hist_goods", "hist_pid", "hist_longview"],
+    "label_cond": ["hist_longview", "hist_pid"],
+    "label_pred": ["hist_longview", "hist_pid"],
+}
 
 
 # ─── Task-specific prompt templates (extracted from the official RecIF benchmark) ───
@@ -526,6 +544,19 @@ class RecIFDataset(Dataset):
 
         return sample
 
+    def _extract_hist_pids_for_task(self, sample: dict, task_type: str) -> list[int]:
+        """Pick the correct history column for the given task.
+
+        This is the v2 fix: previously a fixed priority list always hit a video
+        column for ad/product, so the card described video preferences even for
+        ad/product targets. Now we use a per-task ordered fallback.
+        """
+        cols = TASK_HIST_COLS.get(task_type, ["hist_pid", "hist_longview", "hist_ad", "hist_goods"])
+        for col in cols:
+            if col in sample and sample[col] is not None and len(sample[col]) > 0:
+                return [int(p) for p in sample[col]]
+        return []
+
     def _enrich_from_cache(self, sample: dict) -> dict:
         """Inject pre-computed card from cache. Zero LLM calls."""
         metadata = sample.get("metadata", {})
@@ -561,21 +592,20 @@ class RecIFDataset(Dataset):
             uid = int(metadata.get("uid", 0))
             task_type = sample.get("task_type", "video")
 
-            # Extract history PIDs from sample fields
-            hist_pids = []
-            for col in ["hist_pid", "hist_longview", "hist_ad", "hist_goods"]:
-                if col in sample and sample[col] is not None:
-                    hist_pids = [int(p) for p in sample[col]]
-                    break
+            # v2 fix: task-aware history extraction
+            hist_pids = self._extract_hist_pids_for_task(sample, task_type)
 
             hist_labels = None
 
+            # v2 fix: pass video/product mappings so cross_domain works for ad/product
             plan = self.planner.plan(
                 uid=uid,
                 task_type=task_type,
                 hist_pids=hist_pids,
                 hist_labels=hist_labels,
                 pid2sid=self.pid2sid,
+                pid2sid_video=self.pid2sid,
+                pid2sid_product=self.pid2sid_product,
             )
 
             context_card = self.executor.execute(plan)

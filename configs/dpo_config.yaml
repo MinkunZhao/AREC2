@@ -1,4 +1,4 @@
-# DPO (RecPO) Training Configuration
+# DPO (RecPO) Training Configuration (v2)
 
 model:
   base_model_path: "OpenOneRec/OneRec-1.7B"
@@ -17,9 +17,15 @@ data:
   preferences_dir: "./data/preferences"
   max_samples: 200000  # max samples to draw from for pair generation
 
+# Pre-computed cards (MUST match what SFT used). 06_generate_preferences.py
+# reads these so the enrichment prompt at preference-gen time == SFT/eval time.
+cards_v2_dir: "./data/cards_v2"
+
 training:
-  beta: 0.1
-  loss_type: "sigmoid"   # was "ipo" — 先用标准 DPO 验证不退化，再换 ipo
+  # v2: lower beta + chosen-NLL anchoring to stop cross-task negative transfer.
+  beta: 0.05            # was 0.1; lower => stays closer to SFT reference
+  rpo_alpha: 1.0        # NLL-on-chosen anchoring weight; 0 disables. tune in [0.5, 1.0]
+  loss_type: "sigmoid"  # keep standard DPO; do NOT switch to ipo until verified
   learning_rate: 5.0e-6
   num_train_epochs: 1
   per_device_train_batch_size: 4

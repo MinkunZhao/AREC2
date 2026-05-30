@@ -1,23 +1,32 @@
-"""Generate DPO preference pairs for RecPO.
+"""Generate DPO preference pairs for RecPO (v2, fixes ad/product/label_pred regression).
 
 Strategies (see arec2/rl/preference_pair_gen.py):
-  P1 - On-policy hard negative (default workhorse): greedy decode, rejected =
-       model's own top-ranked non-GT SIDs.
-  P2 - Score-based hard negative (optional, --use-scoring): rejected = highest
-       log-prob non-GT candidates from a per-sample candidate pool.
+  P1 - On-policy hard negative (default for SID tasks): greedy decode, rejected =
+       model's own top-ranked non-GT SIDs. For ad/product (ambiguous candidate
+       space) we take rank [need, 2*need) instead of the single top non-GT.
+  P2 - Score-based hard negative (optional, --use-scoring).
+  B  - Binary judgement pairs for label_pred (是/否). NO SID tokens, so DPO does
+       not steal first-token mass from 是/否 (which AUC eval reads).
 
-All chosen/rejected are canonicalized + length-matched so DPO learns item
-identity, not formatting. prompt + chosen reconstructs an SFT-consistent
-sequence.
+KEY v2 FIXES:
+  1. Per-task quota: --max-pairs is split evenly across --tasks so video can't
+     starve ad/product/label_pred. Avoids cross-task negative transfer from an
+     all-video preference set.
+  2. card_source defaults to "llm_optimized" (reads data/cards_v2) so the
+     enrichment prompt EXACTLY matches SFT and eval. Use --card-source heuristic
+     only if cards_v2 is unavailable (data_loader now extracts hist per task and
+     passes video/product mappings, so heuristic is also领域-correct).
+  3. label_pred uses binary pairs, never SID pairs.
 
-RECOMMENDED FIRST RUN (to verify DPO no longer regresses):
+RECOMMENDED FIRST RUN (verify no regression):
     python scripts/06_generate_preferences.py --config configs/dpo_config.yaml \
         --tasks video --max-pairs 20000
 
-Output: data/preferences/all_pairs.parquet  ({"prompt","chosen","rejected"})
+FULL RUN (all 5 trainable tasks, balanced):
+    python scripts/06_generate_preferences.py --config configs/dpo_config.yaml \
+        --tasks video ad product label_cond label_pred --max-pairs 100000
 
-Usage:
-    python scripts/06_generate_preferences.py --config configs/dpo_config.yaml
+Output: data/preferences/all_pairs.parquet  ({"prompt","chosen","rejected"})
 """
 
 import argparse
@@ -42,6 +51,8 @@ from arec2.retrieval.stores import (
     ProfileStore,
 )
 from arec2.rl.preference_pair_gen import (
+    BINARY_TASKS,
+    generate_binary_pair,
     generate_onpolicy_pairs_batch,
     generate_score_hardneg_pair,
     pair_to_dict,
@@ -81,13 +92,19 @@ def flatten_messages(messages: list[dict]) -> list[dict]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate DPO preference pairs (RecPO)")
+    parser = argparse.ArgumentParser(description="Generate DPO preference pairs (RecPO v2)")
     parser.add_argument("--config", type=str, default="configs/dpo_config.yaml")
     parser.add_argument("--tasks", type=str, nargs="*",
-                        default=["video", "ad", "product", "label_cond"],
-                        help="Start with just 'video' to validate Gate D first.")
-    parser.add_argument("--max-pairs", type=int, default=50000)
+                        default=["video", "ad", "product", "label_cond", "label_pred"],
+                        help="Tasks to generate pairs for. Each gets an equal quota of --max-pairs.")
+    parser.add_argument("--max-pairs", type=int, default=100000,
+                        help="Total pair budget, split EVENLY across --tasks (per-task quota).")
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--card-source", type=str, default="llm_optimized",
+                        choices=["llm_optimized", "heuristic"],
+                        help="MUST match what SFT used. Default llm_optimized reads data/cards_v2.")
+    parser.add_argument("--cards-v2-dir", type=str, default=None,
+                        help="Override cards_v2 dir; default reads from config['cards_v2_dir'] or ./data/cards_v2.")
     parser.add_argument("--use-scoring", action="store_true",
                         help="Enable P2 score-based hard negatives as a fallback "
                              "when on-policy yields too few non-GT SIDs.")
@@ -101,6 +118,10 @@ def main():
     config = load_config(args.config)
     rng = random.Random(args.seed)
     random.seed(args.seed)
+
+    tasks = list(dict.fromkeys(args.tasks))  # de-dup, keep order
+    per_task_cap = max(1, args.max_pairs // max(1, len(tasks)))
+    logger.info("Per-task quota: %d pairs/task across tasks=%s", per_task_cap, tasks)
 
     # ---- Load SFT model (merged) ----
     base_path = config["model"]["base_model_path"]
@@ -119,31 +140,13 @@ def main():
     else:
         logger.warning("SFT checkpoint not found at %s; generating from base model.", sft_ckpt)
 
-    # ---- Stores + enrichment pipeline (must mirror training) ----
-    stores_config = config["stores"]
-    profile_store = ProfileStore.load(stores_config["profile_store_path"])
-    label_store = LabelBehaviorStore.load(stores_config["label_store_path"])
-    collab_store = CollaborativeStore.load(stores_config["collab_store_path"])
-    text_store = ItemTextStore.load(stores_config["text_store_path"])
-
-    planner = PlannerAgent(token_budget=1024)
-    executor = ExecutorAgent(
-        profile_store=profile_store,
-        label_store=label_store,
-        collab_store=collab_store,
-        text_store=text_store,
-        token_budget=1024,
-        card_style="natural",
-    )
-
     # ---- PID->SID ----
     df_pid = pd.read_parquet(config["data"]["pid2sid_path"])
     pid2sid = {int(row["pid"]): list(row["sid"]) for _, row in df_pid.iterrows()}
-    
+
     pid2sid_product = {}
     product_path = config["data"].get("pid2sid_product_path", "")
     if not product_path:
-        # fall back to the training config's convention
         product_path = "./data/recif/product_pid2sid.parquet"
     if Path(product_path).exists():
         df_prod = pd.read_parquet(product_path)
@@ -153,122 +156,185 @@ def main():
     else:
         logger.warning("product pid2sid not found at %s; product task will yield 0 samples",
                        product_path)
-    
+
     sid_pool = build_sid_pool(pid2sid)
     logger.info("Loaded %d PID->SID; SID pool size=%d", len(pid2sid), len(sid_pool))
 
-    # ---- Dataset (enriched, same cards as SFT) ----
-    logger.info("Loading RecIF dataset with enrichment (tasks=%s)...", args.tasks)
-    recif_dataset = RecIFDataset(
-        data_dir=config["data"]["recif_data_dir"],
-        tasks=args.tasks,
-        planner=planner,
-        executor=executor,
-        pid2sid=pid2sid,
-        pid2sid_product=pid2sid_product,
-        card_source="heuristic",
-        max_samples=config["data"].get("max_samples", args.max_pairs * 3),
-        seed=args.seed,
-    )
-    logger.info("Dataset has %d samples", len(recif_dataset))
+    # ---- Stores + enrichment pipeline (only needed for heuristic card_source) ----
+    planner = None
+    executor = None
+    cards_v2_dir = args.cards_v2_dir or config.get("cards_v2_dir") or "./data/cards_v2"
+
+    if args.card_source == "heuristic":
+        stores_config = config["stores"]
+        profile_store = ProfileStore.load(stores_config["profile_store_path"])
+        label_store = LabelBehaviorStore.load(stores_config["label_store_path"])
+        collab_store = CollaborativeStore.load(stores_config["collab_store_path"])
+        text_store = ItemTextStore.load(stores_config["text_store_path"])
+        planner = PlannerAgent(token_budget=1024)
+        executor = ExecutorAgent(
+            profile_store=profile_store,
+            label_store=label_store,
+            collab_store=collab_store,
+            text_store=text_store,
+            token_budget=1024,
+            card_style="natural",
+        )
+        logger.info("Heuristic enrichment pipeline loaded.")
+    else:
+        if not Path(cards_v2_dir).exists():
+            logger.error(
+                "card_source=llm_optimized but cards_v2 dir %s missing. "
+                "Run scripts/05b_precompute_cards.py first, or use --card-source heuristic.",
+                cards_v2_dir,
+            )
+            sys.exit(1)
+        logger.info("Using pre-computed cards from %s (matches SFT).", cards_v2_dir)
 
     output_dir = Path(config["data"]["preferences_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    indices = list(range(len(recif_dataset)))
-    rng.shuffle(indices)
-
-    all_pairs = []
+    all_pairs: list[dict] = []
+    per_task_counts: dict[str, int] = {t: 0 for t in tasks}
     n_onpolicy = 0
     n_score = 0
+    n_binary = 0
     t_start = time.time()
-    last_log = 0
-    last_ckpt = 0
 
-    # -- Collect valid samples into batches, then generate in one call --
-    batch_buf: list[tuple[list[dict], str, list[str]]] = []
-
-    def _flush_batch():
-        nonlocal n_onpolicy, n_score, last_log, last_ckpt
-        if not batch_buf:
-            return
-        try:
-            pairs = generate_onpolicy_pairs_batch(
-                model, batch_buf,
-                filler_pool=sid_pool, rng=rng,
-                max_new_tokens=args.max_new_tokens,
-            )
-        except Exception as e:
-            logger.debug("Batch generation failed: %s", e)
-            batch_buf.clear()
-            return
-
-        for (prompt_msgs, gt_answer, gt_list), pair in zip(batch_buf, pairs):
-            if len(all_pairs) >= args.max_pairs:
-                break
-            if pair is not None:
-                all_pairs.append(pair_to_dict(pair))
-                n_onpolicy += 1
-            elif args.use_scoring:
-                try:
-                    pool = list(dict.fromkeys(gt_list))
-                    while len(pool) < args.cand_pool_size and sid_pool:
-                        cand = rng.choice(sid_pool)
-                        if cand not in pool:
-                            pool.append(cand)
-                    p2 = generate_score_hardneg_pair(
-                        model, prompt_msgs, gt_answer, pool, rng=rng,
-                    )
-                    if p2 is not None:
-                        all_pairs.append(pair_to_dict(p2))
-                        n_score += 1
-                except Exception as e:
-                    logger.debug("P2 fallback failed: %s", e)
-
-        batch_buf.clear()
-
-        cur = len(all_pairs)
-        elapsed = time.time() - t_start
-        if cur // 500 > last_log and cur:
-            last_log = cur // 500
-            logger.info(
-                "[progress] %d pairs (onpolicy=%d, score=%d) | %.1f pairs/min",
-                cur, n_onpolicy, n_score, cur / elapsed * 60,
-            )
-        if cur // 2000 > last_ckpt and cur:
-            last_ckpt = cur // 2000
+    def _save_checkpoint():
+        if all_pairs:
             pd.DataFrame(all_pairs).to_parquet(output_dir / "all_pairs.parquet", index=False)
-            logger.info("Checkpoint saved: %d pairs", cur)
 
-    for idx in indices:
-        if len(all_pairs) >= args.max_pairs:
-            break
+    # ---- Process one task at a time so quotas are respected independently ----
+    for task in tasks:
+        logger.info("=" * 60)
+        logger.info("Generating pairs for task=%s (quota=%d)", task, per_task_cap)
 
-        sample = recif_dataset[idx]
-        messages = sample.get("messages_enriched") or sample.get("messages", [])
-        flat = flatten_messages(messages)
-        if len(flat) < 2 or flat[-1]["role"] != "assistant":
-            continue
+        recif_dataset = RecIFDataset(
+            data_dir=config["data"]["recif_data_dir"],
+            tasks=[task],
+            planner=planner,
+            executor=executor,
+            pid2sid=pid2sid,
+            pid2sid_product=pid2sid_product,
+            card_source=args.card_source,
+            cards_v2_dir=cards_v2_dir if args.card_source == "llm_optimized" else None,
+            max_samples=per_task_cap * 3,
+            seed=args.seed,
+        )
+        logger.info("  Dataset(%s) has %d samples", task, len(recif_dataset))
 
-        gt_answer = flat[-1]["content"]
-        gt_list = parse_sid_list(gt_answer)
-        if not gt_list:
-            continue
+        indices = list(range(len(recif_dataset)))
+        rng.shuffle(indices)
 
-        batch_buf.append((flat[:-1], gt_answer, gt_list))
-        if len(batch_buf) >= args.batch_size:
+        is_binary = task in BINARY_TASKS
+
+        # Buffer for batched P1 (SID tasks only)
+        batch_buf: list[tuple[list[dict], str, list[str]]] = []
+
+        def _flush_batch():
+            nonlocal n_onpolicy, n_score
+            if not batch_buf:
+                return
+            try:
+                pairs = generate_onpolicy_pairs_batch(
+                    model, batch_buf,
+                    filler_pool=sid_pool, rng=rng,
+                    max_new_tokens=args.max_new_tokens,
+                    task_types=[task] * len(batch_buf),
+                )
+            except Exception as e:
+                logger.debug("Batch generation failed: %s", e)
+                batch_buf.clear()
+                return
+
+            for (prompt_msgs, gt_answer, gt_list), pair in zip(batch_buf, pairs):
+                if per_task_counts[task] >= per_task_cap:
+                    break
+                if pair is not None:
+                    all_pairs.append(pair_to_dict(pair))
+                    per_task_counts[task] += 1
+                    n_onpolicy += 1
+                elif args.use_scoring:
+                    try:
+                        pool = list(dict.fromkeys(gt_list))
+                        while len(pool) < args.cand_pool_size and sid_pool:
+                            cand = rng.choice(sid_pool)
+                            if cand not in pool:
+                                pool.append(cand)
+                        p2 = generate_score_hardneg_pair(
+                            model, prompt_msgs, gt_answer, pool, rng=rng, task_type=task,
+                        )
+                        if p2 is not None:
+                            all_pairs.append(pair_to_dict(p2))
+                            per_task_counts[task] += 1
+                            n_score += 1
+                    except Exception as e:
+                        logger.debug("P2 fallback failed: %s", e)
+            batch_buf.clear()
+
+        last_log = 0
+        for idx in indices:
+            if per_task_counts[task] >= per_task_cap:
+                break
+
+            sample = recif_dataset[idx]
+            messages = sample.get("messages_enriched") or sample.get("messages", [])
+            flat = flatten_messages(messages)
+            if len(flat) < 2 or flat[-1]["role"] != "assistant":
+                continue
+
+            gt_answer = flat[-1]["content"]
+            prompt_msgs = flat[:-1]
+
+            if is_binary:
+                # Binary judgement pair: no SID parsing, no generation needed.
+                try:
+                    bp = generate_binary_pair(model, prompt_msgs, gt_answer, task_type=task)
+                except Exception as e:
+                    logger.debug("Binary pair failed: %s", e)
+                    bp = None
+                if bp is not None:
+                    all_pairs.append(pair_to_dict(bp))
+                    per_task_counts[task] += 1
+                    n_binary += 1
+            else:
+                gt_list = parse_sid_list(gt_answer)
+                if not gt_list:
+                    continue
+                batch_buf.append((prompt_msgs, gt_answer, gt_list))
+                if len(batch_buf) >= args.batch_size:
+                    _flush_batch()
+
+            # progress / checkpoint
+            cur = per_task_counts[task]
+            if cur // 500 > last_log and cur:
+                last_log = cur // 500
+                elapsed = time.time() - t_start
+                logger.info(
+                    "  [%s] %d/%d | total=%d (onpolicy=%d, score=%d, binary=%d) | %.1f pairs/min",
+                    task, cur, per_task_cap, len(all_pairs),
+                    n_onpolicy, n_score, n_binary, len(all_pairs) / elapsed * 60,
+                )
+                _save_checkpoint()
+
+        # flush any remaining SID batch for this task
+        if not is_binary:
             _flush_batch()
 
-    _flush_batch()
+        logger.info("  Task %s done: %d pairs", task, per_task_counts[task])
+        _save_checkpoint()
 
-    if all_pairs:
-        pd.DataFrame(all_pairs).to_parquet(output_dir / "all_pairs.parquet", index=False)
+    _save_checkpoint()
 
     elapsed = time.time() - t_start
     logger.info("=" * 60)
     logger.info("Preference generation complete!")
+    for t in tasks:
+        logger.info("  %-12s : %d pairs", t, per_task_counts[t])
     logger.info("  On-policy hard-neg pairs: %d", n_onpolicy)
     logger.info("  Score hard-neg pairs:     %d", n_score)
+    logger.info("  Binary judgement pairs:   %d", n_binary)
     logger.info("  Total:                    %d", len(all_pairs))
     logger.info("  Time: %.1f min", elapsed / 60)
     logger.info("  Saved to: %s", output_dir / "all_pairs.parquet")
