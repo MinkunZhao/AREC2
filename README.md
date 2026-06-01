@@ -85,8 +85,12 @@ python scripts/02_test_agentic_pipeline.py
 当前项目只保留 `configs/training_config.yaml` 作为 SFT 配置入口，`configs/training_config_quick.yaml` 已删除。
 
 ```bash
-python scripts/03_train_sft.py --config configs/training_config.yaml
+python scripts/03_train_sft.py \
+  --config configs/training_config.yaml \
+  --card_source heuristic
 ```
+
+`03_train_sft.py` 当前命令行默认使用 `--card_source heuristic`，即用规则 planner/executor/compiler 在训练样本格式化阶段即时生成卡片；如果已经生成 `data/cards_v2/`，可以改用 `--card_source llm_optimized` 直接读取预计算卡片，或用 `--card_source none` 做无上下文增强基线。`--ablation a0` 会等价切换到 `card_source=none`。
 
 如果需要快速实验，直接在 `configs/training_config.yaml` 中临时调小采样量，例如：
 
@@ -108,18 +112,20 @@ training:
   - `heuristic`：训练时即时使用规则 planner/executor/compiler 生成卡片
   - `llm_optimized`：从 `data/cards_v2/` 读取预计算 LLM 优化卡片
   - `none`：关闭上下文增强
+- `heuristic` 模式可通过 `--planner rule` 或 `--planner llm` 选择规则 planner / LLM planner
 - 默认最大长度为 4096，并使用 `truncate_preserving_answer` 保留 assistant answer
+- v3 训练脚本会一次性预格式化并缓存 tokenized samples；`--format-workers` 控制格式化并行度，`--packing` 可开启短样本序列打包
 
 训练输出默认写入：
 
-- `checkpoints/arec2-lora-r16/`
+- `checkpoints/arec2-lora-r16-v2/`
 
 ### 4. 合并 LoRA
 
 ```bash
 python scripts/04_merge_lora.py \
   --base_model ./models/1.7B \
-  --lora_path ./checkpoints/arec2-lora-r16/final \
+  --lora_path ./checkpoints/arec2-lora-r16-v2/final \
   --output_dir ./models/arec2-merged
 ```
 
@@ -162,8 +168,8 @@ data:
 ```bash
 python scripts/06_generate_preferences.py \
   --config configs/dpo_config.yaml \
-  --tasks video ad product label_cond \
-  --max-pairs 50000
+  --tasks video ad product label_cond label_pred \
+  --max-pairs 100000
 ```
 
 输出：
@@ -180,11 +186,12 @@ python scripts/07_train_dpo.py --config configs/dpo_config.yaml
 
 当前 RecPO/DPO 设计重点：
 
-- P1 on-policy hard negative 是默认策略
+- P1 on-policy hard negative 是 SID 任务的默认策略，`--max-pairs` 会按 `--tasks` 均分，避免单任务偏好对主导训练
 - `chosen` 是 ground-truth SID 列表
 - `rejected` 是模型自己生成的非 GT 高置信 SID，并进行 canonicalize 与长度匹配
-- DPO 前会把 SFT LoRA merge 到 base，再挂载新的 DPO LoRA
-- reference 使用 fresh adapter disabled 的等价模型，脚本里带有 reference equivalence sanity check
+- `label_pred` 使用二分类偏好对，不生成 SID token，避免破坏“是/否”判别 logits
+- DPO 前会把 SFT LoRA merge 到 base，再挂载新的 DPO LoRA；当前配置输出到 `checkpoints/arec2-dpo-r16/`
+- reference 使用 fresh adapter disabled 的等价模型，脚本里带有 reference equivalence sanity check，并默认启用 `rpo_alpha` chosen-NLL anchoring
 
 ### 7. RecIF 评测与消融
 
@@ -193,12 +200,14 @@ python scripts/07_train_dpo.py --config configs/dpo_config.yaml
 ```bash
 python scripts/08_eval_recif.py \
   --model ./models/1.7B \
-  --adapter ./checkpoints/arec2-lora-r16/final \
+  --adapter ./checkpoints/arec2-dpo-r16/final \
   --tasks video ad product label_cond interactive label_pred \
   --batch-size 64 \
   --num-beams 128 \
   --num-return-sequences 128
 ```
+
+`--adapter` 默认是 `./checkpoints/arec2-lora-r16-v2/final`。如果要评测 DPO/RecPO LoRA，显式传入 `./checkpoints/arec2-dpo-r16/final`；如果评测 base model，传入空字符串 `--adapter ""`。
 
 常用快速 smoke：
 
@@ -220,13 +229,15 @@ python scripts/08_eval_recif.py \
 - `label_pred`：AUC
 - `item_understand`、`rec_reason`：可选外部 LLM judge
 
+`rec_reason` 任务上下文更长，评测脚本已经加入独立的显存保护参数：`--rec-reason-batch-size`、`--rec-reason-max-input-tokens`、`--rec-reason-max-new-tokens`、`--rec-reason-oom-fallback-input-tokens` 和 `--rec-reason-oom-fallback-new-tokens`。
+
 运行 ablation sweep：
 
 ```bash
 python scripts/09_run_ablations.py
 ```
 
-`09_run_ablations.py` 内置了 base、SFT v1、SFT v2、SFT+DPO、关闭测试时 enrichment 等配置，便于对比不同训练和上下文设置。
+`09_run_ablations.py` 内置了 base、SFT v1、SFT v2、SFT+DPO、关闭测试时 enrichment 等配置，便于对比不同训练和上下文设置；当前 A3-A5 已指向 `checkpoints/arec2-dpo-r16/final`，与 `configs/dpo_config.yaml` 的输出目录保持一致。
 
 ## 环境安装
 
@@ -285,11 +296,14 @@ python scripts/02_test_agentic_pipeline.py
 # 检查 SFT 数据管线
 python scripts/test_data_pipeline.py
 
-# SFT 训练
-python scripts/03_train_sft.py --config configs/training_config.yaml
+# 检查 loss mask、截断保留 answer、训练/评测 tokenization 一致性
+python scripts/sanity_check.py --config configs/training_config.yaml
+
+# SFT 训练；如要读取预计算 cards_v2，可把 card_source 改为 llm_optimized
+python scripts/03_train_sft.py --config configs/training_config.yaml --card_source heuristic
 
 # 合并 LoRA
-python scripts/04_merge_lora.py --base_model ./models/1.7B --lora_path ./checkpoints/arec2-lora-r16/final --output_dir ./models/arec2-merged
+python scripts/04_merge_lora.py --base_model ./models/1.7B --lora_path ./checkpoints/arec2-lora-r16-v2/final --output_dir ./models/arec2-merged
 
 # TextGrad 优化 prompt
 python scripts/05_run_textgrad.py --config configs/textgrad_config.yaml
@@ -297,8 +311,8 @@ python scripts/05_run_textgrad.py --config configs/textgrad_config.yaml
 # 预计算 cards_v2
 python scripts/05b_precompute_cards.py --config configs/textgrad_config.yaml
 
-# 生成 DPO 偏好对
-python scripts/06_generate_preferences.py --config configs/dpo_config.yaml --tasks video --max-pairs 20000
+# 生成 DPO 偏好对；快速验证可只跑 video，完整训练建议覆盖 5 个训练任务
+python scripts/06_generate_preferences.py --config configs/dpo_config.yaml --tasks video ad product label_cond label_pred --max-pairs 100000
 
 # DPO 训练
 python scripts/07_train_dpo.py --config configs/dpo_config.yaml
@@ -317,14 +331,14 @@ python scripts/09_run_ablations.py
 SFT 配置，默认：
 
 - base model：`OpenOneRec/OneRec-1.7B`
-- 输出目录：`checkpoints/arec2-lora-r16/`
+- 输出目录：`checkpoints/arec2-lora-r16-v2/`
 - LoRA：`r=16`、`alpha=32`、`dropout=0.05`
 - RecIF tasks：`video`、`ad`、`product`、`label_cond`、`label_pred`
-- `max_recif_samples: null`
-- `max_general_samples: 119250`
-- batch size：16
+- `max_recif_samples: 50000`
+- `max_general_samples: 12500`
+- batch size：8
 - max length：4096
-- card source：`heuristic`
+- 配置文件中的 `data.card_source` 与训练脚本默认值均为 `heuristic`，默认即时生成规则卡片；需要使用预计算卡片时显式传入 `--card_source llm_optimized`
 
 ### `configs/textgrad_config.yaml`
 
@@ -343,9 +357,11 @@ SFT 配置，默认：
 用于 RecPO/DPO：
 
 - SFT checkpoint 路径
-- DPO LoRA 输出路径
+- DPO LoRA 输出路径：`checkpoints/arec2-dpo-r16/`
 - preference parquet 路径
-- DPO beta、loss type、max length、max prompt length
+- 默认偏好对生成上限：`max_samples: 200000`
+- DPO LoRA：`r=16`、`alpha=16`、`dropout=0.05`
+- DPO beta：`0.05`，并默认启用 `rpo_alpha: 1.0`、`loss_type: sigmoid`、max length、max prompt length
 
 ## 开发与验证
 
@@ -361,6 +377,7 @@ python scripts/sanity_check.py --config configs/training_config.yaml
 
 - 项目全称统一为 Agentic Retrieval-Enrichment for Context-Aware Generative Recommendation，简称 AREC^2
 - `configs/training_config_quick.yaml` 已移除，所有训练和 sanity check 命令都应显式传入 `configs/training_config.yaml`
+- `03_train_sft.py` 默认使用 `heuristic` 规则卡片；若要复用 `data/cards_v2/` 的预计算卡片，显式加 `--card_source llm_optimized`
 - `caches/` 是当前代码使用的缓存目录，不是旧文档里的 `cache/`
 - 本地模型目录当前是 `models/1.7B/`，部分旧示例里的 `models/1.7B-pretrain/` 需要按实际情况替换
 - `scripts/08_eval_recif.py --enrich true` 参数保留兼容性，但脚本说明中标注它会改变 benchmark prompt，不适合作为 paper-comparable 官方结果
