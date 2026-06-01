@@ -15,6 +15,13 @@ Design (post bug-fix v2):
       instead of the single most-confident non-GT, avoiding over-penalizing
       合理次优 items.
 
+  v3 fix (correct "model already right" skip):
+    - Previously `if rejected == gt_list: return None` was dead code: rejected
+      is forced to be non-GT, so it could never equal gt_list. The intended
+      signal — "the model's own top-`need` predictions already match GT, so
+      there is no useful contrast" — is now detected explicitly by comparing
+      the model's de-duplicated top-`need` predictions against the GT set.
+
 Strategies:
   P1 - On-policy hard negative (workhorse):
         chosen   = ground-truth SID list (canonical)
@@ -94,6 +101,25 @@ def _turn_end_token(tokenizer) -> str:
 def _finalize_completion(sid_list: list[str], tokenizer) -> str:
     """Join canonical SIDs (no separator, like SFT) and append the turn-end."""
     return "".join(sid_list) + _turn_end_token(tokenizer)
+
+
+def _model_already_correct(pred_list: list[str], gt_set: set[str], need: int) -> bool:
+    """True if the model's de-duplicated top-`need` predictions already match GT.
+
+    This is the signal the old `rejected == gt_list` check was supposed to
+    capture but never did (rejected is always non-GT). When the model is already
+    right, there is no useful contrast to learn from, so the caller should skip.
+    """
+    seen: set[str] = set()
+    top: list[str] = []
+    for s in pred_list:
+        if s in seen:
+            continue
+        seen.add(s)
+        top.append(s)
+        if len(top) == need:
+            break
+    return len(top) == need and set(top) == gt_set
 
 
 def _match_length(
@@ -194,12 +220,15 @@ def generate_onpolicy_pair(
         return None
 
     pred_list = parse_sid_list(gens[0])
+
+    # If the model is already correct, there is no useful contrast — skip.
+    if _model_already_correct(pred_list, gt_set, need):
+        return None
+
     rejected = _match_length(
         pred_list, need, gt_set, filler_pool, rng, rank_offset=rank_offset
     )
     if rejected is None:
-        return None
-    if rejected == gt_list:  # model fully correct (rare) -> no useful signal
         return None
 
     return DPOPair(
@@ -247,10 +276,16 @@ def generate_onpolicy_pairs_batch(
         need = len(gt_list)
         rank_offset = need if task_type in AMBIGUOUS_SID_TASKS else 0
         pred_list = parse_sid_list(gen_text)
+
+        # Skip when the model is already fully correct (no useful contrast).
+        if _model_already_correct(pred_list, gt_set, need):
+            results.append(None)
+            continue
+
         rejected = _match_length(
             pred_list, need, gt_set, filler_pool, rng, rank_offset=rank_offset
         )
-        if rejected is None or rejected == gt_list:
+        if rejected is None:
             results.append(None)
             continue
         results.append(DPOPair(
@@ -293,7 +328,7 @@ def generate_score_hardneg_pair(
     rejected = _match_length(
         ranked_non_gt, need, gt_set, None, rng, rank_offset=rank_offset
     )
-    if rejected is None or rejected == gt_list:
+    if rejected is None:
         return None
 
     return DPOPair(
@@ -356,7 +391,7 @@ def generate_counterfactual_pair(
 
     weak_list = parse_sid_list(weak_gen[0])
     rejected = _match_length(weak_list, need, gt_set, filler_pool, rng)
-    if rejected is None or rejected == gt_list:
+    if rejected is None:
         return None
 
     return DPOPair(

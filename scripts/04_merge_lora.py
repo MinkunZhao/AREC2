@@ -2,8 +2,8 @@
 
 Usage:
     python scripts/04_merge_lora.py \
-        --base_model ./models/1.7B-pretrain \
-        --lora_path ./checkpoints/arec2-lora-r16/final \
+        --base_model ./models/1.7B \
+        --lora_path ./checkpoints/arec2-lora-r16-v2/final \
         --output_dir ./models/arec2-merged
 """
 
@@ -20,9 +20,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 def main():
     parser = argparse.ArgumentParser(description="Merge LoRA adapters into base model")
-    parser.add_argument("--base_model", type=str, default="./models/1.7B-pretrain",
-                        help="Path to base model")
-    parser.add_argument("--lora_path", type=str, default="./checkpoints/arec2-lora-r16/final",
+    # FIX: default base model is the actual local dir (./models/1.7B), not the
+    # non-existent ./models/1.7B-pretrain. You can also pass the HF name
+    # "OpenOneRec/OneRec-1.7B".
+    parser.add_argument("--base_model", type=str, default="./models/1.7B",
+                        help="Path to base model (or HF name OpenOneRec/OneRec-1.7B)")
+    # FIX: default LoRA path matches the SFT v2 output directory.
+    parser.add_argument("--lora_path", type=str, default="./checkpoints/arec2-lora-r16-v2/final",
                         help="Path to LoRA adapter directory")
     parser.add_argument("--output_dir", type=str, default="./models/arec2-merged",
                         help="Output directory for merged model")

@@ -2,7 +2,11 @@
 
 model:
   base_model_path: "OpenOneRec/OneRec-1.7B"
-  sft_checkpoint_path: "./checkpoints/arec2-lora-r16/final"
+  # FIX: must point at the SFT v2 LoRA that training_config.yaml actually writes
+  # (./checkpoints/arec2-lora-r16-v2/final). The old value (arec2-lora-r16/final)
+  # did not exist, so DPO silently fell back to the raw base model and RecPO was
+  # effectively training on top of an un-finetuned model.
+  sft_checkpoint_path: "./checkpoints/arec2-lora-r16-v2/final"
   output_dir: "./checkpoints/arec2-dpo-r16"
 
 lora:

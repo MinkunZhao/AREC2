@@ -64,7 +64,7 @@ ALL_TASKS = RECALL_TASKS + AUC_TASKS + LLM_SCORE_TASKS
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Official-style RecIF evaluation")
     parser.add_argument("--model", type=str, default="OpenOneRec/OneRec-1.7B")
-    parser.add_argument("--adapter", type=str, default="./checkpoints/arec2-dpo-r16/final", help="Optional LoRA adapter to merge before eval")
+    parser.add_argument("--adapter", type=str, default="./checkpoints/arec2-lora-r16-v2/final", help="Optional LoRA adapter to merge before eval")
     parser.add_argument("--benchmark-dir", type=str, default="./data/recif/benchmark_data")
     parser.add_argument("--tasks", type=str, nargs="*", default=None, help="Default: all RecIF tasks")
     parser.add_argument("--max-samples", type=int, default=None)

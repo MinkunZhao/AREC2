@@ -1,12 +1,32 @@
 """Phase 4: SFT Training with Agentic Context Enrichment.
 
 Trains OpenOneRec-1.7B with LoRA on enriched RecIF + General_SFT data.
+
+v3 throughput fixes (no change to learned objective):
+  1. FormattedDataset now CACHES the tokenized result during pre-filtering and
+     serves it from memory at __getitem__ time. Previously every sample was
+     tokenized once during pre-filter AND again every epoch in __getitem__
+     (double tokenization + no real use of dataloader workers). Now each sample
+     is tokenized exactly once.
+  2. Pre-filtering/formatting is parallelized across processes (--format-workers).
+     This is a one-time cost, not per-epoch.
+  3. Optional sequence PACKING (--packing): multiple short samples are
+     concatenated up to max_length, with per-sample label masking preserved and
+     cross-sample attention blocked via position_ids reset + segment-aware mask.
+     RecIF answers are short, so packing greatly raises token utilization.
+  4. max_length / num_workers are read from config; set max_length to the real
+     p99 sequence length to cut padding compute and allow larger batches.
+
+The loss mask semantics are IDENTICAL to before: loss is computed only on the
+final assistant answer (prompt tokens are -100). Packing concatenates already
+correctly-masked samples, so it does not change which tokens contribute to loss.
 """
 
 import argparse
 import logging
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -43,6 +63,25 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("train_sft")
+
+
+# ---------------------------------------------------------------------------
+# Module-level globals for the process pool. ProcessPoolExecutor pickles the
+# worker function; tokenizers (fast) are picklable, but to be safe and fast we
+# initialize a per-worker tokenizer once via an initializer.
+# ---------------------------------------------------------------------------
+_WORKER_TOKENIZER = None
+_WORKER_MAX_LENGTH = 4096
+
+
+def _format_worker_init(tokenizer_path: str, max_length: int):
+    global _WORKER_TOKENIZER, _WORKER_MAX_LENGTH
+    _WORKER_TOKENIZER = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    _WORKER_MAX_LENGTH = max_length
+
+
+def _format_worker(sample: dict):
+    return format_sample_for_training(sample, _WORKER_TOKENIZER, _WORKER_MAX_LENGTH)
 
 
 def load_config(config_path: str) -> dict:
@@ -196,45 +235,132 @@ def create_training_args(config: dict) -> TrainingArguments:
 
 
 class FormattedDataset(torch.utils.data.Dataset):
-    """Wrapper that formats samples on-the-fly, filtering those that are too long."""
+    """Pre-formats samples ONCE and serves the cached tokenized result.
 
-    def __init__(self, base_dataset, tokenizer, max_length: int = 4096):
-        self.base_dataset = base_dataset
-        self.tokenizer = tokenizer
+    Previously this class tokenized every sample during pre-filtering and then
+    tokenized it AGAIN on every __getitem__ (i.e. every epoch). Now the
+    tokenized dict is cached in memory and returned directly, so each sample is
+    tokenized exactly once. Pre-formatting can be parallelized across processes.
+    """
+
+    def __init__(self, base_dataset, tokenizer, max_length: int = 4096,
+                 tokenizer_path: str | None = None, format_workers: int = 1):
         self.max_length = max_length
-
-        # Pre-filter: build valid index list and count skipped samples
-        self.valid_indices = []
+        self.cache: list[dict] = []
         self.skipped = 0
-        logger.info("Pre-filtering dataset for length constraints (max_length=%d)...", max_length)
-        for idx in range(len(base_dataset)):
-            sample = base_dataset[idx]
-            formatted = format_sample_for_training(sample, tokenizer, max_length)
-            if formatted is not None:
-                self.valid_indices.append(idx)
-            else:
-                self.skipped += 1
 
         logger.info(
-            "Dataset filtering complete: %d valid, %d skipped (%.1f%% filtered)",
-            len(self.valid_indices),
+            "Pre-formatting dataset (max_length=%d, workers=%d)...",
+            max_length, format_workers,
+        )
+        t0 = time.time()
+
+        # Materialize raw samples first (this triggers enrichment / dict lookups).
+        # For card_source='llm_optimized' this is cheap; for 'heuristic' it is the
+        # bulk of the cost and is unavoidable, but at least it now happens once.
+        raw_samples = [base_dataset[i] for i in range(len(base_dataset))]
+
+        if format_workers > 1 and tokenizer_path is not None:
+            with ProcessPoolExecutor(
+                max_workers=format_workers,
+                initializer=_format_worker_init,
+                initargs=(tokenizer_path, max_length),
+            ) as pool:
+                for formatted in pool.map(_format_worker, raw_samples, chunksize=64):
+                    if formatted is not None:
+                        self.cache.append(formatted)
+                    else:
+                        self.skipped += 1
+        else:
+            for sample in raw_samples:
+                formatted = format_sample_for_training(sample, tokenizer, max_length)
+                if formatted is not None:
+                    self.cache.append(formatted)
+                else:
+                    self.skipped += 1
+
+        logger.info(
+            "Pre-formatting complete in %.1fs: %d valid, %d skipped (%.1f%% filtered)",
+            time.time() - t0,
+            len(self.cache),
             self.skipped,
-            100.0 * self.skipped / max(len(base_dataset), 1),
+            100.0 * self.skipped / max(len(raw_samples), 1),
         )
 
     def __len__(self):
-        return len(self.valid_indices)
+        return len(self.cache)
 
     def __getitem__(self, idx):
-        real_idx = self.valid_indices[idx]
-        sample = self.base_dataset[real_idx]
-        formatted = format_sample_for_training(sample, self.tokenizer, self.max_length)
-        # Should not be None since we pre-filtered, but guard anyway
-        if formatted is None:
-            formatted = format_sample_for_training(
-                self.base_dataset[self.valid_indices[0]], self.tokenizer, self.max_length
-            )
-        return formatted
+        return self.cache[idx]
+
+
+class PackedDataset(torch.utils.data.Dataset):
+    """Greedily packs pre-formatted samples up to max_length.
+
+    Each packed example concatenates several samples. Labels keep their original
+    per-sample masking (prompt = -100, answer = real ids), so the supervised
+    objective is unchanged. To prevent tokens of one sample from attending to a
+    different sample, we emit `position_ids` that reset at each segment boundary
+    and a `segment_ids` tensor the collator turns into a block-diagonal mask.
+
+    NOTE: This requires the model's attention to honor a 2D/4D attention mask.
+    If your model/transformers version does not support custom block masks,
+    disable packing (--no-packing) and rely on caching + reduced data instead.
+    """
+
+    def __init__(self, formatted_samples: list[dict], max_length: int = 4096):
+        self.max_length = max_length
+        self.packs: list[dict] = []
+        self._build(formatted_samples)
+        logger.info(
+            "Packing: %d samples -> %d packed sequences (avg %.1f samples/pack)",
+            len(formatted_samples), len(self.packs),
+            len(formatted_samples) / max(len(self.packs), 1),
+        )
+
+    def _build(self, samples: list[dict]):
+        cur_ids, cur_labels, cur_pos, cur_seg = [], [], [], []
+        seg_id = 0
+
+        def flush():
+            nonlocal cur_ids, cur_labels, cur_pos, cur_seg, seg_id
+            if cur_ids:
+                self.packs.append({
+                    "input_ids": cur_ids,
+                    "labels": cur_labels,
+                    "position_ids": cur_pos,
+                    "segment_ids": cur_seg,
+                    "attention_mask": [1] * len(cur_ids),
+                })
+            cur_ids, cur_labels, cur_pos, cur_seg = [], [], [], []
+            seg_id = 0
+
+        for s in samples:
+            ids = s["input_ids"]
+            labels = s["labels"]
+            n = len(ids)
+            if n > self.max_length:
+                # Shouldn't happen (filtered upstream) but guard.
+                ids = ids[:self.max_length]
+                labels = labels[:self.max_length]
+                n = self.max_length
+
+            if len(cur_ids) + n > self.max_length and cur_ids:
+                flush()
+
+            cur_ids.extend(ids)
+            cur_labels.extend(labels)
+            cur_pos.extend(range(n))
+            cur_seg.extend([seg_id] * n)
+            seg_id += 1
+
+        flush()
+
+    def __len__(self):
+        return len(self.packs)
+
+    def __getitem__(self, idx):
+        return self.packs[idx]
 
 
 class SFTDataCollator:
@@ -263,6 +389,52 @@ class SFTDataCollator:
         }
 
 
+class PackedDataCollator:
+    """Collator for PackedDataset.
+
+    Builds a 4D block-diagonal attention mask so each segment only attends to
+    its own (causal) tokens, plus padded position_ids. Falls back gracefully if
+    the model ignores 4D masks (then it behaves like normal causal attention,
+    which slightly leaks across segment boundaries — acceptable but not ideal).
+    """
+
+    def __init__(self, tokenizer):
+        self.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+    def __call__(self, features: list[dict]) -> dict:
+        max_len = max(len(f["input_ids"]) for f in features)
+        bsz = len(features)
+
+        input_ids = torch.full((bsz, max_len), self.pad_token_id, dtype=torch.long)
+        labels = torch.full((bsz, max_len), -100, dtype=torch.long)
+        position_ids = torch.zeros((bsz, max_len), dtype=torch.long)
+
+        # 4D additive mask: (bsz, 1, max_len, max_len), 0 = attend, -inf = block.
+        neg_inf = torch.finfo(torch.bfloat16).min
+        attn_4d = torch.full((bsz, 1, max_len, max_len), neg_inf, dtype=torch.bfloat16)
+
+        for b, f in enumerate(features):
+            ids = f["input_ids"]
+            n = len(ids)
+            input_ids[b, :n] = torch.tensor(ids, dtype=torch.long)
+            labels[b, :n] = torch.tensor(f["labels"], dtype=torch.long)
+            position_ids[b, :n] = torch.tensor(f["position_ids"], dtype=torch.long)
+
+            seg = torch.tensor(f["segment_ids"], dtype=torch.long)
+            # Allow attention only within the same segment AND causal (j <= i).
+            for i in range(n):
+                same_seg = (seg[: i + 1] == seg[i])
+                idxs = torch.arange(i + 1)[same_seg]
+                attn_4d[b, 0, i, idxs] = 0.0
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "position_ids": position_ids,
+            "attention_mask": attn_4d,
+        }
+
+
 def main():
     t0 = time.time()
 
@@ -271,7 +443,7 @@ def main():
     parser.add_argument("--config", type=str, default="configs/training_config.yaml")
     parser.add_argument("--ablation", type=str, default=None, choices=["a0"],
                         help="a0: disable context enrichment (baseline)")
-    parser.add_argument("--card_source", type=str, default="llm_optimized",
+    parser.add_argument("--card_source", type=str, default="heuristic",
                         choices=["heuristic", "llm_optimized", "none"],
                         help="Context card source: heuristic (rule-based on-the-fly), "
                              "llm_optimized (pre-computed from TextGrad), none (no enrichment)")
@@ -279,6 +451,12 @@ def main():
                         choices=["rule", "llm"],
                         help="Planner type for heuristic card_source: rule (PlannerAgent) "
                              "or llm (LLMPlanner, requires LLM config)")
+    parser.add_argument("--format-workers", type=int, default=8,
+                        help="Parallel processes for one-time tokenization/pre-filtering.")
+    parser.add_argument("--packing", action="store_true", default=False,
+                        help="Enable sequence packing (big speedup for short answers).")
+    parser.add_argument("--no-packing", dest="packing", action="store_false",
+                        help="Disable sequence packing.")
     args = parser.parse_args()
 
     config_path = args.config
@@ -338,12 +516,28 @@ def main():
     # Setup model and tokenizer
     model, tokenizer = setup_model_and_tokenizer(config)
 
-    # Wrap dataset with formatting
+    # Wrap dataset with formatting (cached + optionally parallel)
     max_length = config["training"].get("max_length", 4096)
-    train_dataset = FormattedDataset(combined_dataset, tokenizer, max_length=max_length)
+    tokenizer_path = config["model"]["base_model_path"]
 
-    # Data collator: pads input_ids, attention_mask, and labels (with -100 for labels)
-    data_collator = SFTDataCollator(tokenizer=tokenizer)
+    # Parallel formatting only makes sense when enrichment is cheap (llm_optimized
+    # / none): the raw sample materialization happens in the main process. For
+    # heuristic enrichment, raw materialization is the bottleneck and runs in the
+    # main process regardless, so we keep workers but they only do tokenization.
+    formatted = FormattedDataset(
+        combined_dataset, tokenizer, max_length=max_length,
+        tokenizer_path=tokenizer_path, format_workers=max(1, args.format_workers),
+    )
+
+    # Optional packing
+    if args.packing:
+        train_dataset = PackedDataset(formatted.cache, max_length=max_length)
+        data_collator = PackedDataCollator(tokenizer)
+        logger.info("Sequence packing ENABLED.")
+    else:
+        train_dataset = formatted
+        data_collator = SFTDataCollator(tokenizer=tokenizer)
+        logger.info("Sequence packing disabled (use --packing to enable).")
 
     # Training arguments
     training_args = create_training_args(config)
@@ -360,12 +554,13 @@ def main():
     # Train
     logger.info("=" * 60)
     logger.info("Starting training...")
-    logger.info("  Total samples: %d", len(train_dataset))
+    logger.info("  Total training units: %d", len(train_dataset))
     logger.info("  Batch size: %d", training_args.per_device_train_batch_size)
     logger.info("  Gradient accumulation: %d", training_args.gradient_accumulation_steps)
     logger.info("  Effective batch size: %d", training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps)
     logger.info("  Epochs: %d", training_args.num_train_epochs)
     logger.info("  Learning rate: %.2e", training_args.learning_rate)
+    logger.info("  Max length: %d | Packing: %s", max_length, args.packing)
     logger.info("=" * 60)
 
     trainer.train()

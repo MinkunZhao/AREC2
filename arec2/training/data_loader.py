@@ -13,6 +13,16 @@ v2 fix (ad/product DPO regression):
     also given pid2sid_video / pid2sid_product so cross_domain works.
   This guarantees the enrichment card used at preference-generation time
   matches the card used at SFT/eval time for the SAME task.
+
+v3 fix (SFT throughput / balanced sampling):
+  - `max_recif_samples` is now interpreted as a GLOBAL budget that is split
+    EVENLY across the requested tasks (per-task quota), instead of generating
+    all-of-task-A then random-sampling globally (which let `video` dominate
+    and could early-exit before `ad`/`product`/`label_pred` were even built).
+    This keeps the task mix balanced when you reduce the dataset for speed,
+    so per-task eval metrics do not regress from a skewed SFT mix.
+  - Per-task generation also stops as soon as that task's quota is met, so
+    reducing `max_recif_samples` directly reduces wall-clock build time.
 """
 
 from __future__ import annotations
@@ -151,7 +161,8 @@ class RecIFDataset(Dataset):
                 "none" - skip enrichment entirely
             cards_v2_dir: Path to pre-computed card parquets (required when card_source="llm_optimized").
             enrich_context: Legacy flag. Ignored when card_source is explicitly set.
-            max_samples: Maximum samples to load (for quick testing).
+            max_samples: GLOBAL max samples to build. Split EVENLY across `tasks`
+                (per-task quota) so the task mix stays balanced when reduced.
             seed: Random seed for sampling.
         """
         self.data_dir = Path(data_dir)
@@ -196,7 +207,14 @@ class RecIFDataset(Dataset):
         logger.info("Card cache loaded: %d total cards across %d tasks", total, len(self._card_cache))
 
     def _load_and_build_samples(self, max_samples: int | None) -> list[dict]:
-        """Load onerec_bench_release.parquet and build SFT samples."""
+        """Load onerec_bench_release.parquet and build SFT samples.
+
+        Per-task quota strategy:
+          - If `max_samples` is set, it is the GLOBAL budget and is split evenly
+            across `self.tasks` (the last task absorbs any remainder). Each task
+            stops building as soon as its own quota is met.
+          - If `max_samples` is None, all tasks build all available samples.
+        """
         release_path = self.data_dir / "onerec_bench_release.parquet"
         if not release_path.exists():
             logger.error("onerec_bench_release.parquet not found at %s", release_path)
@@ -206,17 +224,22 @@ class RecIFDataset(Dataset):
         df = pd.read_parquet(release_path)
         logger.info("Loaded %d users from release data", len(df))
 
-        # If max_samples is set, estimate how many users we need to process
-        # Each user can generate up to len(self.tasks) samples, but not all succeed
-        # Use a conservative estimate: process enough users to get 2x target samples
+        n_tasks = max(1, len(self.tasks))
         if max_samples:
-            # Estimate: each user generates ~3 valid samples on average across all tasks
-            estimated_users_needed = int(max_samples * 2.0 / 3.0) + 50
-            estimated_users_needed = min(estimated_users_needed, len(df))
-            logger.info("Processing first %d users (estimated for max_samples=%d)", estimated_users_needed, max_samples)
-            df = df.head(estimated_users_needed)
+            base_quota = max_samples // n_tasks
+            # Distribute remainder to the last task so totals match max_samples.
+            quotas = {t: base_quota for t in self.tasks}
+            if self.tasks:
+                quotas[self.tasks[-1]] += max_samples - base_quota * n_tasks
+            logger.info("Per-task quota (global budget=%d): %s", max_samples, quotas)
+            # We do not know up-front how many users yield a valid sample for a
+            # task, so we process users until the quota is hit. A user yields at
+            # most one sample per task, so to fill quota Q we may need up to
+            # ~2-3x users. Process the whole frame but break early per task.
+        else:
+            quotas = {t: None for t in self.tasks}
 
-        all_samples = []
+        all_samples: list[dict] = []
 
         for task in self.tasks:
             template = _TASK_TEMPLATES.get(task)
@@ -224,25 +247,20 @@ class RecIFDataset(Dataset):
                 logger.warning("No template for task: %s, skipping", task)
                 continue
 
-            task_samples = self._build_task_samples(df, task, template)
-            logger.info("  Task '%s': generated %d samples", task, len(task_samples))
+            quota = quotas.get(task)
+            task_samples = self._build_task_samples(df, task, template, quota)
+            logger.info("  Task '%s': generated %d samples (quota=%s)",
+                         task, len(task_samples), quota)
             all_samples.extend(task_samples)
 
-            # Early exit if we already have enough samples
-            if max_samples and len(all_samples) >= max_samples * 1.5:
-                logger.info("  Early exit: already have %d samples (target: %d)", len(all_samples), max_samples)
-                break
-
+        # Shuffle the balanced mix so batches interleave tasks.
         random.shuffle(all_samples)
-
-        if max_samples and len(all_samples) > max_samples:
-            all_samples = random.sample(all_samples, max_samples)
-            logger.info("Sampled down to %d samples", max_samples)
-
         return all_samples
 
-    def _build_task_samples(self, df: pd.DataFrame, task: str, template: dict) -> list[dict]:
-        """Build SFT samples for a specific task from raw user data."""
+    def _build_task_samples(
+        self, df: pd.DataFrame, task: str, template: dict, quota: int | None
+    ) -> list[dict]:
+        """Build SFT samples for a specific task, stopping at `quota` if set."""
         samples = []
         fields = template["fields"]
 
@@ -250,6 +268,8 @@ class RecIFDataset(Dataset):
             sample = self._build_single_sample(row, task, template, fields)
             if sample is not None:
                 samples.append(sample)
+                if quota is not None and len(samples) >= quota:
+                    break
 
         return samples
 
@@ -787,6 +807,10 @@ def format_sample_for_training(sample: dict, tokenizer, max_length: int = 4096) 
     Produces labels with -100 masking on the prompt portion so that loss is
     computed only on the last assistant turn (the answer).
 
+    NOTE: This function does NOT mutate the input `sample`. It builds a local
+    copy of the messages (flattening any list-typed content) so that repeated
+    calls on the same sample are idempotent and worker-safe.
+
     Args:
         sample: Sample dict with 'messages' or 'messages_enriched' field.
         tokenizer: HuggingFace tokenizer with chat template.
@@ -796,12 +820,15 @@ def format_sample_for_training(sample: dict, tokenizer, max_length: int = 4096) 
         Dict with 'input_ids', 'attention_mask', and 'labels' lists,
         or None if the sample should be skipped (prompt alone exceeds max_length).
     """
-    messages = sample.get("messages_enriched") or sample.get("messages", [])
+    raw_messages = sample.get("messages_enriched") or sample.get("messages", [])
 
-    # Flatten content lists to strings
-    for msg in messages:
-        if isinstance(msg.get("content"), list):
-            msg["content"] = " ".join([c.get("text", "") for c in msg["content"] if isinstance(c, dict)])
+    # Build a local, flattened copy WITHOUT mutating the source sample.
+    messages = []
+    for msg in raw_messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = " ".join([c.get("text", "") for c in content if isinstance(c, dict)])
+        messages.append({"role": msg.get("role", "user"), "content": content})
 
     if len(messages) < 2:
         return None
