@@ -2,7 +2,7 @@
 
 Agentic Retrieval-Enrichment for Context-Aware Generative Recommendation
 
-AREC^2 是一个围绕 OpenOneRec/OneRec-1.7B 构建的上下文感知生成式推荐增强框架。项目目标是在 RecIF-Bench 场景中，把用户画像、近期意图、标签行为、跨域信号、协同邻居和文本检索信号组织为可控的 retrieval-enriched context cards，再用于 SFT、RecPO/DPO 和评测，让模型在生成推荐结果时显式利用结构化证据。
+AREC^2 是一个围绕 OpenOneRec/OneRec-1.7B 构建的上下文感知生成式推荐增强框架。项目目标是在 RecIF-Bench 场景中，把用户画像、近期意图、标签行为、跨域信号、协同邻居和文本检索信号组织为可控的 retrieval-enriched context cards，再用于 SFT、RL 阶段的 DPO 偏好优化和评测，让模型在生成推荐结果时显式利用结构化证据。
 
 当前版本已经从早期的规则式 agentic enrichment 扩展到完整实验链路：
 
@@ -13,7 +13,7 @@ AREC^2 是一个围绕 OpenOneRec/OneRec-1.7B 构建的上下文感知生成式�
 - TextGrad prompt 优化：自动优化 planner/compiler prompt，并产出 `prompts/optimized/`
 - 上下文预计算：`data/cards_v2/*.parquet` 支持训练时直接读取优化卡片
 - SFT：RecIF 训练样本 + General_SFT 混合训练 LoRA
-- RecPO/DPO：基于 on-policy hard negative 生成偏好对并继续偏好优化
+- RL 阶段：基于 on-policy hard negative 生成偏好对，并用 DPO 继续偏好优化
 - 官方风格 RecIF 评测：支持召回任务、AUC 任务、LLM judge 任务和消融实验
 
 ## 项目结构
@@ -26,7 +26,7 @@ AREC^2/
 │   ├── enrichment/      # EvidenceGraph 与上下文卡片编译器
 │   ├── eval/            # RecIFRunner 评测封装
 │   ├── retrieval/       # 离线 stores 构建和查询
-│   ├── rl/              # RecPO/DPO 偏好对生成与 DPOTrainer 封装
+│   ├── rl/              # RL 阶段：偏好对生成与 DPOTrainer 封装
 │   ├── textgrad/        # TextGrad prompt 优化组件
 │   ├── tools/           # agentic retrieval tools
 │   └── training/        # RecIF/General_SFT/CombinedDataset 数据管线
@@ -161,7 +161,7 @@ data:
   cards_v2_dir: "./data/cards_v2"
 ```
 
-### 6. RecPO/DPO 偏好训练
+### 6. RL 阶段：DPO 偏好训练
 
 先从 SFT 模型生成偏好对：
 
@@ -184,7 +184,7 @@ data/preferences/all_pairs.parquet
 python scripts/07_train_dpo.py --config configs/dpo_config.yaml
 ```
 
-当前 RecPO/DPO 设计重点：
+当前 RL 阶段设计重点：
 
 - P1 on-policy hard negative 是 SID 任务的默认策略，`--max-pairs` 会按 `--tasks` 均分，避免单任务偏好对主导训练
 - `chosen` 是 ground-truth SID 列表
@@ -207,7 +207,7 @@ python scripts/08_eval_recif.py \
   --num-return-sequences 128
 ```
 
-`--adapter` 默认是 `./checkpoints/arec2-lora-r16-v2/final`。如果要评测 DPO/RecPO LoRA，显式传入 `./checkpoints/arec2-dpo-r16/final`；如果评测 base model，传入空字符串 `--adapter ""`。
+`--adapter` 默认是 `./checkpoints/arec2-lora-r16-v2/final`。如果要评测 DPO LoRA，显式传入 `./checkpoints/arec2-dpo-r16/final`；如果评测 base model，传入空字符串 `--adapter ""`。
 
 常用快速 smoke：
 
@@ -354,7 +354,7 @@ SFT 配置，默认：
 
 ### `configs/dpo_config.yaml`
 
-用于 RecPO/DPO：
+用于 RL 阶段的 DPO 训练：
 
 - SFT checkpoint 路径
 - DPO LoRA 输出路径：`checkpoints/arec2-dpo-r16/`
