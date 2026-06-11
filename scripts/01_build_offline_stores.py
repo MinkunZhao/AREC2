@@ -66,6 +66,7 @@ def main():
     main_data = str(data_dir / "onerec_bench_release.parquet")
 
     t_start = time.time()
+    timings = {}
 
     pid2sid_video = load_pid2sid(str(data_dir / "video_ad_pid2sid.parquet"))
     pid2sid_product = load_pid2sid(str(data_dir / "product_pid2sid.parquet"))
@@ -77,7 +78,8 @@ def main():
         store = ProfileStore()
         store.build(main_data, pid2sid_video, pid2sid_product)
         store.save(str(cache_dir / "profile_store.pkl"))
-        logger.info("ProfileStore done in %.1fs", time.time() - t0)
+        timings["ProfileStore"] = time.time() - t0
+        logger.info("ProfileStore done in %.1fs", timings["ProfileStore"])
 
     if "label_behavior" in args.stores:
         logger.info("=" * 60)
@@ -86,7 +88,8 @@ def main():
         store = LabelBehaviorStore()
         store.build(main_data, pid2sid_video)
         store.save(str(cache_dir / "label_behavior_store.pkl"))
-        logger.info("LabelBehaviorStore done in %.1fs", time.time() - t0)
+        timings["LabelBehaviorStore"] = time.time() - t0
+        logger.info("LabelBehaviorStore done in %.1fs", timings["LabelBehaviorStore"])
 
     if "collaborative" in args.stores:
         logger.info("=" * 60)
@@ -101,7 +104,8 @@ def main():
             max_vocab=args.cooc_max_vocab,
         )
         store.save(str(cache_dir / "collaborative_store"))
-        logger.info("CollaborativeStore done in %.1fs", time.time() - t0)
+        timings["CollaborativeStore"] = time.time() - t0
+        logger.info("CollaborativeStore done in %.1fs", timings["CollaborativeStore"])
 
     if "item_text" in args.stores:
         logger.info("=" * 60)
@@ -111,10 +115,20 @@ def main():
         benchmark_dir = str(data_dir / "benchmark_data")
         store.build(main_data, pid2sid_video, pid2sid_product, benchmark_dir=benchmark_dir)
         store.save(str(cache_dir / "item_text_store.pkl"))
-        logger.info("ItemTextStore done in %.1fs", time.time() - t0)
+        timings["ItemTextStore"] = time.time() - t0
+        logger.info("ItemTextStore done in %.1fs", timings["ItemTextStore"])
 
+    total_elapsed = time.time() - t_start
     logger.info("=" * 60)
-    logger.info("All stores built in %.1fs", time.time() - t_start)
+    logger.info("All stores built in %.1fs", total_elapsed)
+    logger.info("-" * 60)
+    logger.info("Build time breakdown:")
+    for name, elapsed in timings.items():
+        pct = elapsed / total_elapsed * 100 if total_elapsed > 0 else 0
+        logger.info("  %-25s %8.1fs  (%5.1f%%)", name, elapsed, pct)
+    overhead = total_elapsed - sum(timings.values())
+    logger.info("  %-25s %8.1fs  (%5.1f%%)", "(data loading / overhead)",
+                overhead, overhead / total_elapsed * 100 if total_elapsed > 0 else 0)
     logger.info("Cache directory: %s", cache_dir.resolve())
     for f in sorted(cache_dir.iterdir()):
         logger.info("  %s (%.1f MB)", f.name, f.stat().st_size / 1e6)

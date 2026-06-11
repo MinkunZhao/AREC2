@@ -1,0 +1,75 @@
+# Amazon Transfer-Learning Experiment Config (paper §6.3, Strategy 3)
+#
+# Strategy 3 = Text-Augmented Itemic Tokens:
+#   each item -> [original 3-layer pretrained itemic tokens] + [5 keywords]
+# The 3-layer itemic tokens are preserved (no 4th layer), keywords appended
+# as plain text for semantic disambiguation (collision rate ~0.47% in paper).
+
+data:
+  data_dir: "./data/amazon14"          # meta_*.parquet + reviews_*_5.parquet
+  cache_dir: "./caches/amazon"         # A1 writes per-domain artifacts here
+  min_core: 5                          # 5-core filtering (paper §6.1)
+  max_hist_len: 50                     # truncate history to recent N items
+
+# All 10 domains used in the paper (Table 7/8).
+categories:
+  - "Baby"
+  - "Beauty"
+  - "Cell_Phones_and_Accessories"
+  - "Grocery_and_Gourmet_Food"
+  - "Health_and_Personal_Care"
+  - "Home_and_Kitchen"
+  - "Pet_Supplies"
+  - "Sports_and_Outdoors"
+  - "Tools_and_Home_Improvement"
+  - "Toys_and_Games"
+
+tokenization:
+  # Item semantic embedding model (paper uses Qwen3-8B-Embedding; the 0.6B
+  # variant runs anywhere — swap to Qwen/Qwen3-Embedding-8B for full fidelity).
+  embed_model: "Qwen/Qwen3-Embedding-0.6B"
+  codebook_size: 0                     # 0 = auto-resolve per domain (recommended).
+                                       # Paper uses 8192 for its 10M+ item corpus;
+                                       # a single Amazon domain has only a few k items,
+                                       # so 8192 would collapse the 3-layer hierarchy
+                                       # to 1 layer. Auto picks ~sqrt(N)*4, capped at N//2.
+  n_layers: 3                          # (c1, c2, c3) -> <s_a_*><s_b_*><s_c_*>
+  n_keywords: 5                        # Strategy-3 appended keywords
+  batch_size: 64
+  seed: 42
+
+model:
+  # Your AREC² SFT product is an UNMERGED LoRA adapter (full_lora_8b/) on top of
+  # the OneRec-8B base. The scripts load the base, merge this adapter, then
+  # proceed. If you instead have an already-merged full model, point base_model
+  # at it and set sft_adapter to "".
+  base_model: "OpenOneRec/OneRec-8B"   # OneRec base (HF name or local path)
+  sft_adapter: "./full_lora_8b"        # your AREC² SFT LoRA adapter dir
+
+# Training regime (paper §6.3.2): "joint" = multi-domain (paper's headline,
+# +2.3% for OneRec-Foundation), "single" = domain-specific.
+training:
+  regime: "joint"
+  lora_r: 4
+  lora_alpha: 8
+  lora_dropout: 0.05
+  epochs: 1
+  batch_size: 8
+  grad_accum: 2
+  learning_rate: 5.0e-5
+  max_length: 2048
+  augment_subsequences: true           # densify with next-item-at-each-step pairs
+  max_subseq_per_user: 5
+  output_root: "./checkpoints/amazon"
+
+evaluation:
+  # Leave-one-out; report Recall@{5,10}, NDCG@{5,10} (paper §6.1).
+  ks: [5, 10]
+  num_negatives: 99                    # 1+99 sampled-candidate ranking
+  full_ranking: false                  # set true for exact full-corpus ranking (slow)
+  output: "./results/amazon/strategy3_joint.json"
+
+ablations:
+  # itemonly: Strategy-3 with keywords removed (itemic tokens only) — the
+  # contrast the paper draws to show the keyword contribution.
+  run_itemonly: false

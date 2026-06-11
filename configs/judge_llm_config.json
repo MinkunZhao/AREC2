@@ -1,7 +1,7 @@
 {
   "gpt-4o-mini": {
-    "api_key": "sk-hJEO1ngxEgAb0wAAhTml9CR8Skw52sH8PUw36VLpV0sYHB3n",
-    "base_url": "https://yunwu.ai/v1",
+    "api_key": "",
+    "base_url": "",
     "model_name": "gpt-4o-mini",
     "max_new_tokens": 10000,
     "temperature": 0.01,

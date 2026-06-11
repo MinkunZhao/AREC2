@@ -63,21 +63,21 @@ ALL_TASKS = RECALL_TASKS + AUC_TASKS + LLM_SCORE_TASKS
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Official-style RecIF evaluation")
-    parser.add_argument("--model", type=str, default="OpenOneRec/OneRec-1.7B")
-    parser.add_argument("--adapter", type=str, default="./checkpoints/arec2-lora-r16-v2/final", help="Optional LoRA adapter to merge before eval")
+    parser.add_argument("--model", type=str, default="OpenOneRec/OneRec-8B")
+    parser.add_argument("--adapter", type=str, default="./checkpoints/arec2-dpo-8B-r16-v2/final", help="Optional LoRA adapter to merge before eval")
     parser.add_argument("--benchmark-dir", type=str, default="./data/recif/benchmark_data")
     parser.add_argument("--tasks", type=str, nargs="*", default=None, help="Default: all RecIF tasks")
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=64, help="HF beam-search batch size")
+    parser.add_argument("--batch-size", type=int, default=16, help="HF beam-search batch size")
     parser.add_argument("--num-beams", type=int, default=128,
                         help="Beam width for SID generation (official: max(16, 128)=128)")
     parser.add_argument("--num-return-sequences", type=int, default=128,
                         help="Number of SID candidates to return (official: 128)")
-    parser.add_argument("--beam-chunk-size", type=int, default=32,
+    parser.add_argument("--beam-chunk-size", type=int, default=8,
                         help="Process beams in chunks of this size to limit memory. "
                              "Results are exact regardless of chunk size.")
     parser.add_argument("--max-input-tokens", type=int, default=None, help="Default: no truncation, same as official eval")
-    parser.add_argument("--rec-reason-batch-size", type=int, default=32,
+    parser.add_argument("--rec-reason-batch-size", type=int, default=8,
                         help="Batch size for rec_reason generation. Default: 1 to avoid long-context OOM.")
     parser.add_argument("--rec-reason-max-input-tokens", type=int, default=8192,
                         help="Left-truncate rec_reason prompts to this many tokens. 0 disables truncation.")
@@ -162,8 +162,15 @@ def load_model_and_tokenizer():
     return tok, model
 
 
+_t0 = time.time()
 benchmark_data = load_benchmark()
+_time_benchmark_load = time.time() - _t0
+
+_t0 = time.time()
 tokenizer, model = load_model_and_tokenizer()
+_time_model_load = time.time() - _t0
+
+print(f"\n[Timing] Benchmark load: {_time_benchmark_load:.2f}s, Model load: {_time_model_load:.2f}s")
 
 
 def model_device() -> torch.device:
@@ -361,18 +368,20 @@ def expand_cache(prefix_cache, repeats: int):
 
 
 def custom_three_token_beam_search(prompt: str, beam_width: int, chunk_size: int = 32) -> list[str]:
-    """Memory-efficient exact beam search for 3 SID tokens.
+    """Memory-efficient EXACT beam search for 3 SID tokens.
 
-    Processes beams in chunks of ``chunk_size`` so that only
-    ``chunk_size × prefix_KV`` bytes of cache are live at any time, instead
-    of ``beam_width × prefix_KV``.  The global top-K selection is performed
-    on the *complete* score matrix assembled from all chunks, so results are
-    **identical** to a single beam search with width ``beam_width``.
+    Identical results to the previous implementation, but never materializes a
+    full (beam_width, vocab) log-prob tensor. Within each chunk we immediately
+    top-k-truncate to `beam_width` candidate tokens per beam, so the peak memory
+    is O(beam_width^2) instead of O(beam_width * vocab). This is exact because
+    the global top-`beam_width` extension of any beam must lie within that beam's
+    own top-`beam_width` next tokens.
 
     Matches the official OpenOneRec vLLM evaluation:
       beam_width = max(num_beams=16, num_return_sequences=128) = 128
     """
     device = model_device()
+    W = beam_width
 
     # Phase 1 — prefill prompt + <|sid_begin|>, get top-W first-token scores
     inputs = tokenize_single(prompt + SID_BEGIN)
@@ -380,38 +389,45 @@ def custom_three_token_beam_search(prompt: str, beam_width: int, chunk_size: int
         out0 = model(**inputs, use_cache=True)
     prefix_cache = out0.past_key_values
     lp0 = torch.log_softmax(out0.logits[0, -1, :].float(), dim=-1)
-    scores_1, tokens_1 = torch.topk(lp0, k=beam_width)
+    scores_1, tokens_1 = torch.topk(lp0, k=W)           # (W,), (W,)
     del out0, lp0
 
-    # Phase 2 — for every first token, score all second tokens (chunked)
-    step2_chunks: list[torch.Tensor] = []
-    for s in range(0, beam_width, chunk_size):
-        e = min(s + chunk_size, beam_width)
+    # Phase 2 — for every first token, keep only top-W second tokens (chunked).
+    # We store per-beam (value, token-id) instead of the full vocab row.
+    s2_vals_chunks: list[torch.Tensor] = []   # each (chunk, W)
+    s2_toks_chunks: list[torch.Tensor] = []   # each (chunk, W)
+    for s in range(0, W, chunk_size):
+        e = min(s + chunk_size, W)
         chunk_tok = tokens_1[s:e]
         cs = e - s
         cache_c = expand_cache(prefix_cache, cs)
         with torch.no_grad():
             o1 = model(input_ids=chunk_tok.unsqueeze(1),
                        past_key_values=cache_c, use_cache=True)
-        step2_chunks.append(
-            torch.log_softmax(o1.logits[:, -1, :].float(), dim=-1))
-        del cache_c, o1
+        lp = torch.log_softmax(o1.logits[:, -1, :].float(), dim=-1)  # (cs, V)
+        tv, tt = torch.topk(lp, k=W, dim=-1)                          # (cs, W) each
+        s2_vals_chunks.append(tv)
+        s2_toks_chunks.append(tt)
+        del cache_c, o1, lp, tv, tt
 
-    step2_lp = torch.cat(step2_chunks, dim=0)          # (W, V)
-    del step2_chunks
-    combined_2 = scores_1.unsqueeze(1) + step2_lp       # (W, V)
-    V = combined_2.shape[1]
+    s2_vals = torch.cat(s2_vals_chunks, dim=0)   # (W, W)
+    s2_toks = torch.cat(s2_toks_chunks, dim=0)   # (W, W)
+    del s2_vals_chunks, s2_toks_chunks
 
-    flat_2, idx_2 = torch.topk(combined_2.reshape(-1), k=beam_width)
-    parent_2 = idx_2.div(V, rounding_mode="floor")
-    tok_2 = idx_2.remainder(V)
-    sel_t1 = tokens_1[parent_2]
-    del combined_2, step2_lp
+    # Combine first-token score with each beam's top-W second tokens.
+    combined_2 = scores_1.unsqueeze(1) + s2_vals          # (W, W)
+    flat_2, idx_2 = torch.topk(combined_2.reshape(-1), k=W)
+    parent_2 = idx_2.div(W, rounding_mode="floor")        # which first-token beam
+    local_2 = idx_2.remainder(W)                          # which of its top-W second tokens
+    sel_t1 = tokens_1[parent_2]                           # (W,) first tokens
+    tok_2 = s2_toks[parent_2, local_2]                    # (W,) second tokens
+    del combined_2, s2_vals, s2_toks
 
-    # Phase 3 — for every (t1, t2) pair, score all third tokens (chunked)
-    step3_chunks: list[torch.Tensor] = []
-    for s in range(0, beam_width, chunk_size):
-        e = min(s + chunk_size, beam_width)
+    # Phase 3 — for every (t1, t2) pair, keep only top-W third tokens (chunked).
+    s3_vals_chunks: list[torch.Tensor] = []
+    s3_toks_chunks: list[torch.Tensor] = []
+    for s in range(0, W, chunk_size):
+        e = min(s + chunk_size, W)
         cs = e - s
         t1c = sel_t1[s:e]
         t2c = tok_2[s:e]
@@ -421,21 +437,25 @@ def custom_three_token_beam_search(prompt: str, beam_width: int, chunk_size: int
                        past_key_values=cache_c, use_cache=True)
             ob = model(input_ids=t2c.unsqueeze(1),
                        past_key_values=oa.past_key_values, use_cache=True)
-        step3_chunks.append(
-            torch.log_softmax(ob.logits[:, -1, :].float(), dim=-1))
-        del cache_c, oa, ob
+        lp = torch.log_softmax(ob.logits[:, -1, :].float(), dim=-1)   # (cs, V)
+        tv, tt = torch.topk(lp, k=W, dim=-1)                           # (cs, W)
+        s3_vals_chunks.append(tv)
+        s3_toks_chunks.append(tt)
+        del cache_c, oa, ob, lp, tv, tt
 
-    step3_lp = torch.cat(step3_chunks, dim=0)           # (W, V)
-    del step3_chunks
-    combined_3 = flat_2.unsqueeze(1) + step3_lp          # (W, V)
-    flat_3, idx_3 = torch.topk(combined_3.reshape(-1), k=beam_width)
-    parent_3 = idx_3.div(V, rounding_mode="floor")
-    tok_3 = idx_3.remainder(V)
+    s3_vals = torch.cat(s3_vals_chunks, dim=0)   # (W, W)
+    s3_toks = torch.cat(s3_toks_chunks, dim=0)   # (W, W)
+    del s3_vals_chunks, s3_toks_chunks
+
+    combined_3 = flat_2.unsqueeze(1) + s3_vals            # (W, W)
+    flat_3, idx_3 = torch.topk(combined_3.reshape(-1), k=W)
+    parent_3 = idx_3.div(W, rounding_mode="floor")
+    local_3 = idx_3.remainder(W)
 
     final_t1 = sel_t1[parent_3]
     final_t2 = tok_2[parent_3]
-    final_t3 = tok_3
-    del prefix_cache, combined_3, step3_lp
+    final_t3 = s3_toks[parent_3, local_3]
+    del prefix_cache, combined_3, s3_vals, s3_toks
 
     return [
         clean_decoded(tokenizer.decode(
@@ -444,11 +464,17 @@ def custom_three_token_beam_search(prompt: str, beam_width: int, chunk_size: int
     ]
 
 
-def batch_generate_recommendations(prompts: list[str]) -> list[list[str]]:
+def batch_generate_recommendations(prompts: list[str], _sample_times: list[float] | None = None) -> list[list[str]]:
     if args.num_return_sequences != args.num_beams:
         raise ValueError("The custom RecIF beam search expects --num-return-sequences == --num-beams")
-    return [custom_three_token_beam_search(prompt, args.num_beams, args.beam_chunk_size)
-            for prompt in prompts]
+    results = []
+    for prompt in prompts:
+        t0 = time.time()
+        r = custom_three_token_beam_search(prompt, args.num_beams, args.beam_chunk_size)
+        if _sample_times is not None:
+            _sample_times.append(time.time() - t0)
+        results.append(r)
+    return results
 
 
 def evaluate_recall_task(task_name: str) -> dict[str, Any] | None:
@@ -457,17 +483,26 @@ def evaluate_recall_task(task_name: str) -> dict[str, Any] | None:
         return None
 
     print(f"\n--- {task_name}: official-style beam candidates, n={len(df)} ---")
+
+    t_prep = time.time()
     prompts = [build_prompt(row["messages"], enable_thinking=False) for _, row in df.iterrows()]
     metadata = [get_metadata(row) for _, row in df.iterrows()]
+    t_prompt_build = time.time() - t_prep
+
+    t_map = time.time()
     sid_pid_mapping = load_sid_pid_mapping(task_name)
+    t_mapping_load = time.time() - t_map
+
+    print(f"  Prep: prompt_build={t_prompt_build:.2f}s, sid_pid_mapping={t_mapping_load:.2f}s")
 
     sid_metric_sums = {name: 0.0 for name in ("pass@1", "position1_pass@1", "recall@1", "pass@32", "position1_pass@32", "recall@32")}
     pid_metric_sums = {f"pid_{name}": 0.0 for name in sid_metric_sums}
     total_samples = len(df)
+    sample_times: list[float] = []
 
     for batch_indices in tqdm(list(chunked(list(range(len(prompts))), args.batch_size)), desc=task_name):
         batch_prompts = [prompts[i] for i in batch_indices]
-        batch_generations = batch_generate_recommendations(batch_prompts)
+        batch_generations = batch_generate_recommendations(batch_prompts, _sample_times=sample_times)
 
         for idx, generations in zip(batch_indices, batch_generations):
             pred_sids = [extract_sid(gen) for gen in generations]
@@ -491,6 +526,17 @@ def evaluate_recall_task(task_name: str) -> dict[str, Any] | None:
     if sid_pid_mapping and total_samples:
         results.update({key: round(value / total_samples, 4) for key, value in pid_metric_sums.items()})
     results["num_samples"] = total_samples
+    if sample_times:
+        for i, dt in enumerate(sample_times):
+            print(f"    [{task_name}] sample {i}/{total_samples}: {dt:.3f}s")
+        avg_t = sum(sample_times) / len(sample_times)
+        print(f"  Inference avg: {avg_t:.3f}s/sample, total: {sum(sample_times):.1f}s")
+    results["_timing"] = {
+        "prompt_build": round(t_prompt_build, 3),
+        "sid_pid_mapping": round(t_mapping_load, 3),
+        "inference_total": round(sum(sample_times), 3),
+        "inference_avg": round(sum(sample_times) / len(sample_times), 3) if sample_times else 0,
+    }
     print(f"  pass@1={results.get('pass@1', 0):.4f}, pass@32={results.get('pass@32', 0):.4f}, recall@32={results.get('recall@32', 0):.4f}, total={total_samples}")
     return results
 
@@ -519,17 +565,39 @@ def evaluate_auc_task(task_name: str) -> dict[str, Any] | None:
         return None
 
     print(f"\n--- {task_name}: next-token 是/否 AUC, n={len(df)} ---")
+
+    t_prep = time.time()
     prompts = [build_prompt(row["messages"], enable_thinking=False) for _, row in df.iterrows()]
     labels = [1 if get_metadata(row).get("answer", "").strip() == "是" else 0 for _, row in df.iterrows()]
+    t_prompt_build = time.time() - t_prep
+    print(f"  Prep: prompt_build={t_prompt_build:.2f}s")
 
     scores = []
+    sample_times: list[float] = []
     for batch_indices in tqdm(list(chunked(list(range(len(prompts))), max(args.batch_size, 1))), desc=task_name):
         batch_prompts = [prompts[i] for i in batch_indices]
+        t_inf = time.time()
         scores.extend(batch_label_scores(batch_prompts))
+        dt = time.time() - t_inf
+        per_sample = dt / len(batch_indices)
+        for i in batch_indices:
+            sample_times.append(per_sample)
+            print(f"    [{task_name}] sample {i}/{len(prompts)}: ~{per_sample:.3f}s")
 
     auc = roc_auc_score(labels, scores) if len(set(labels)) == 2 else 0.5
+    if sample_times:
+        avg_t = sum(sample_times) / len(sample_times)
+        print(f"  Inference avg: {avg_t:.3f}s/sample, total: {sum(sample_times):.1f}s")
     print(f"  AUC={auc:.4f}, positives={sum(labels)}, negatives={len(labels) - sum(labels)}")
-    return {"auc": round(float(auc), 4), "num_samples": len(labels)}
+    return {
+        "auc": round(float(auc), 4),
+        "num_samples": len(labels),
+        "_timing": {
+            "prompt_build": round(t_prompt_build, 3),
+            "inference_total": round(sum(sample_times), 3),
+            "inference_avg": round(sum(sample_times) / len(sample_times), 3) if sample_times else 0,
+        },
+    }
 
 
 def clear_cuda_memory() -> None:
@@ -663,7 +731,7 @@ def oom_safe_batch_generate_text(
             return ["" for _ in prompts]
 
 
-def generate_llm_task(task_name: str) -> tuple[dict[str, str], dict[str, str]]:
+def generate_llm_task(task_name: str) -> tuple[dict[str, str], dict[str, str], dict[str, Any]]:
     df = benchmark_data[task_name]
     enable_thinking = task_name == "rec_reason"
     max_new_tokens = args.rec_reason_max_new_tokens if task_name == "rec_reason" else 128
@@ -676,9 +744,14 @@ def generate_llm_task(task_name: str) -> tuple[dict[str, str], dict[str, str]]:
     fallback_input_tokens = normalize_token_limit(args.rec_reason_oom_fallback_input_tokens)
     fallback_new_tokens = max(args.rec_reason_oom_fallback_new_tokens, 1)
 
+    t_prep = time.time()
     prompts = [build_prompt(row["messages"], enable_thinking=enable_thinking) for _, row in df.iterrows()]
     refs = {str(i): get_metadata(row).get("answer", "") for i, (_, row) in enumerate(df.iterrows())}
+    t_prompt_build = time.time() - t_prep
+    print(f"  Prep: prompt_build={t_prompt_build:.2f}s")
+
     preds: dict[str, str] = {}
+    sample_times: list[float] = []
 
     if task_name == "rec_reason":
         print(
@@ -690,6 +763,7 @@ def generate_llm_task(task_name: str) -> tuple[dict[str, str], dict[str, str]]:
 
     for batch_indices in tqdm(list(chunked(list(range(len(prompts))), batch_size)), desc=f"{task_name}-gen"):
         batch_prompts = [prompts[i] for i in batch_indices]
+        t_inf = time.time()
         if task_name == "rec_reason":
             texts = oom_safe_batch_generate_text(
                 batch_prompts,
@@ -707,9 +781,22 @@ def generate_llm_task(task_name: str) -> tuple[dict[str, str], dict[str, str]]:
                 do_sample=False,
                 repetition_penalty=repetition_penalty,
             )
+        dt = time.time() - t_inf
+        per_sample = dt / len(batch_indices)
         for idx, text in zip(batch_indices, texts):
+            sample_times.append(per_sample)
+            print(f"    [{task_name}] sample {idx}/{len(prompts)}: ~{per_sample:.3f}s")
             preds[str(idx)] = text
-    return preds, refs
+
+    if sample_times:
+        avg_t = sum(sample_times) / len(sample_times)
+        print(f"  Inference avg: {avg_t:.3f}s/sample, total: {sum(sample_times):.1f}s")
+    timing = {
+        "prompt_build": round(t_prompt_build, 3),
+        "inference_total": round(sum(sample_times), 3),
+        "inference_avg": round(sum(sample_times) / len(sample_times), 3) if sample_times else 0,
+    }
+    return preds, refs, timing
 
 
 class _OpenAIJudgeClient:
@@ -834,8 +921,8 @@ def evaluate_llm_task(task_name: str, api=None) -> dict[str, Any] | None:
         return None
 
     print(f"\n--- {task_name}: generation with optional external judge ---")
-    preds, refs = generate_llm_task(task_name)
-    result: dict[str, Any] = {"num_samples": len(preds), "judge_enabled": args.judge == "true"}
+    preds, refs, gen_timing = generate_llm_task(task_name)
+    result: dict[str, Any] = {"num_samples": len(preds), "judge_enabled": args.judge == "true", "_timing": gen_timing}
 
     if args.judge != "true":
         print("  Judge disabled. Score requires --judge true and judge LLM config.")
@@ -905,10 +992,33 @@ def main() -> None:
                 f"{task:<16} macro_wip_double_weighted_f1="
                 f"{res.get('macro_wip_double_weighted_f1', 'NA')} samples={res.get('num_samples', 0)}"
             )
-    print(f"Total time: {elapsed:.1f}s")
+
+    print("\n" + "-" * 72)
+    print("Timing Breakdown")
+    print("-" * 72)
+    print(f"  Benchmark data load:    {_time_benchmark_load:.2f}s")
+    print(f"  Model + tokenizer load: {_time_model_load:.2f}s")
+    for task, res in all_results.items():
+        t = res.get("_timing", {})
+        if not t:
+            continue
+        parts = [f"prompt_build={t.get('prompt_build', 0):.3f}s"]
+        if "sid_pid_mapping" in t:
+            parts.append(f"sid_pid_mapping={t['sid_pid_mapping']:.3f}s")
+        parts.append(f"inference_total={t.get('inference_total', 0):.1f}s")
+        parts.append(f"inference_avg={t.get('inference_avg', 0):.3f}s/sample")
+        print(f"  {task:<16} {', '.join(parts)}")
+    print(f"  Total wall time:        {elapsed:.1f}s")
+    print("-" * 72)
 
     output_path = Path(args.output or f"results/eval_official_{Path(args.model).name.replace('/', '_')}.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    timing_summary = {
+        "benchmark_load": round(_time_benchmark_load, 2),
+        "model_load": round(_time_model_load, 2),
+        "per_task": {task: res["_timing"] for task, res in all_results.items() if "_timing" in res},
+    }
+    serializable_results = {task: {k: v for k, v in res.items() if k != "_timing"} for task, res in all_results.items()}
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(
             {
@@ -916,7 +1026,8 @@ def main() -> None:
                 "adapter": args.adapter,
                 "official_style": True,
                 "elapsed_seconds": round(elapsed, 1),
-                "tasks": all_results,
+                "timing": timing_summary,
+                "tasks": serializable_results,
             },
             f,
             ensure_ascii=False,
